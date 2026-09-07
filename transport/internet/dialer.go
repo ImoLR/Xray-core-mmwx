@@ -8,6 +8,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/dice"
 	"github.com/xtls/xray-core/common/errors"
+	customconnection "github.com/xtls/xray-core/common/mmwxcustom/connection"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/net/cnc"
 	"github.com/xtls/xray-core/common/session"
@@ -241,7 +242,9 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		}
 	}
 	if sockopt == nil {
-		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+		return customconnection.TrackDial(ctx, dest, func() (net.Conn, error) {
+			return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+		})
 	}
 
 	if newDest, err := checkAddressPortStrategy(ctx, dest, sockopt); err == nil && newDest != nil {
@@ -264,7 +267,9 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 			dest.Address = net.IPAddress(ips[dice.Roll(len(ips))])
 			errors.LogInfo(ctx, "replace destination with "+dest.String())
 		} else {
-			return TcpRaceDial(ctx, src, ips, dest.Port, sockopt, dest.Address.String())
+			return customconnection.TrackDial(ctx, dest, func() (net.Conn, error) {
+				return TcpRaceDial(ctx, src, ips, dest.Port, sockopt, dest.Address.String())
+			})
 		}
 	}
 
@@ -279,7 +284,9 @@ func DialSystem(ctx context.Context, dest net.Destination, sockopt *SocketConfig
 		return redirect(ctx, dest, sockopt.DialerProxy, h), nil
 	}
 
-	return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+	return customconnection.TrackDial(ctx, dest, func() (net.Conn, error) {
+		return effectiveSystemDialer.Dial(ctx, src, dest, sockopt)
+	})
 }
 
 func InitSystemDialer(dc dns.Client, om outbound.Manager) {

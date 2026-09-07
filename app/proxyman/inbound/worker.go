@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
+	customconnection "github.com/xtls/xray-core/common/mmwxcustom/connection"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/common/session"
@@ -102,6 +103,8 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	}
 	ctx = session.ContextWithOutbounds(ctx, outbounds)
 
+	conn = customconnection.TrackInbound(conn)
+	trackedConn := conn
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
 		conn = &stat.CounterConnection{
 			Connection:   conn,
@@ -114,7 +117,7 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 		Local:   net.DestinationFromAddr(conn.LocalAddr()),
 		Gateway: net.TCPDestination(w.address, w.port),
 		Tag:     w.tag,
-		Conn:    conn,
+		Conn:    trackedConn,
 	})
 
 	content := new(session.Content)

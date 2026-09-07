@@ -11,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/log"
+	customconnection "github.com/xtls/xray-core/common/mmwxcustom/connection"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
@@ -157,6 +158,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
+		customconnection.BindInbound(ctx, sessionInbound.Conn)
 	}
 
 	if user != nil && len(user.Email) > 0 {
@@ -198,6 +200,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
+		customconnection.BindInbound(ctx, sessionInbound.Conn)
 	}
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}

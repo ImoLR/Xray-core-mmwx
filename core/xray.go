@@ -7,6 +7,7 @@ import (
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	customconnection "github.com/xtls/xray-core/common/mmwxcustom/connection"
 	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/features"
@@ -187,6 +188,9 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 }
 
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+	if err := customconnection.EnsureControlServerFromEnvironment(); err != nil {
+		return true, errors.New("failed to start mmwx custom connection control").Base(err)
+	}
 	server.ctx = context.WithValue(server.ctx, "cone",
 		platform.NewEnvFlag(platform.UseCone).GetValue(func() string { return "" }) != "true")
 
