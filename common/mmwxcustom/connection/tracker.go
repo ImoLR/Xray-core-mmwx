@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	stdnet "net"
+	"net/netip"
 	"sort"
 	"sync"
 	"syscall"
@@ -23,6 +24,8 @@ type Identity struct {
 
 type Limit struct {
 	Identity                   Identity `json:"identity"`
+	MaxInboundOnlineIPs        *int     `json:"max_inbound_online_ips"`
+	MaxTotalConnections        *int64   `json:"max_total_connections"`
 	MaxOutboundTCPActive       *int64   `json:"max_outbound_tcp_active"`
 	MaxOutboundTCPNewPerSecond *int     `json:"max_outbound_tcp_new_per_second"`
 	CloseWaitTimeoutSeconds    *int64   `json:"close_wait_timeout_seconds"`
@@ -30,34 +33,74 @@ type Limit struct {
 
 type Config struct {
 	DefaultCloseWaitTimeoutSeconds *int64  `json:"default_close_wait_timeout_seconds"`
+	OnlineIPGracePeriodSeconds     int64   `json:"online_ip_grace_period_seconds"`
+	MaxGlobalTotalConnections      *int64  `json:"max_global_total_connections"`
 	Limits                         []Limit `json:"limits"`
 }
 
+type TCPStateCounts struct {
+	Total       int64 `json:"tcp_total"`
+	Established int64 `json:"established"`
+	SynSent     int64 `json:"syn_sent"`
+	SynRecv     int64 `json:"syn_recv"`
+	FinWait1    int64 `json:"fin_wait_1"`
+	FinWait2    int64 `json:"fin_wait_2"`
+	TimeWait    int64 `json:"time_wait"`
+	CloseWait   int64 `json:"close_wait"`
+	LastAck     int64 `json:"last_ack"`
+	Closing     int64 `json:"closing"`
+	Close       int64 `json:"close"`
+	Unknown     int64 `json:"unknown"`
+}
+
+type OnlineIP struct {
+	IP          string `json:"ip"`
+	Connections int64  `json:"connections"`
+}
+
+type GlobalSnapshot struct {
+	CurrentTotal             int64  `json:"current_total"`
+	MaxTotal                 *int64 `json:"max_total"`
+	RejectedGlobalTotalLimit uint64 `json:"rejected_global_total_limit"`
+}
+
 type Snapshot struct {
-	Identity                   Identity `json:"identity"`
-	InboundName                string   `json:"inbound_name,omitempty"`
-	InboundPort                uint32   `json:"inbound_port,omitempty"`
-	OutboundTag                string   `json:"outbound_tag,omitempty"`
-	Attributed                 bool     `json:"attributed"`
-	InboundActive              int64    `json:"inbound_active"`
-	InboundTotal               uint64   `json:"inbound_total"`
-	OutboundActive             int64    `json:"outbound_active"`
-	OutboundPending            int64    `json:"outbound_pending"`
-	OutboundNewTotal           uint64   `json:"outbound_new_total"`
-	OutboundNewRate            int      `json:"outbound_new_rate"`
-	OutboundRejectedTotal      uint64   `json:"outbound_rejected_total"`
-	RejectedActiveLimit        uint64   `json:"rejected_active_limit"`
-	RejectedNewRateLimit       uint64   `json:"rejected_new_rate_limit"`
-	MaxOutboundTCPActive       *int64   `json:"max_outbound_tcp_active"`
-	MaxOutboundTCPNewPerSecond *int     `json:"max_outbound_tcp_new_per_second"`
-	CloseWaitTimeoutSeconds    *int64   `json:"close_wait_timeout_seconds"`
+	Identity                   Identity       `json:"identity"`
+	InboundName                string         `json:"inbound_name,omitempty"`
+	InboundPort                uint32         `json:"inbound_port,omitempty"`
+	OutboundTag                string         `json:"outbound_tag,omitempty"`
+	Attributed                 bool           `json:"attributed"`
+	InboundActive              int64          `json:"inbound_active"`
+	InboundTotal               uint64         `json:"inbound_total"`
+	CurrentTotal               int64          `json:"current_total"`
+	InboundTCP                 TCPStateCounts `json:"inbound_tcp"`
+	InboundOnlineIPs           []OnlineIP     `json:"inbound_online_ips"`
+	OutboundActive             int64          `json:"outbound_active"`
+	OutboundPending            int64          `json:"outbound_pending"`
+	OutboundTCP                TCPStateCounts `json:"outbound_tcp"`
+	OutboundNewTotal           uint64         `json:"outbound_new_total"`
+	OutboundNewRate            int            `json:"outbound_new_rate"`
+	OutboundRejectedTotal      uint64         `json:"outbound_rejected_total"`
+	RejectedActiveLimit        uint64         `json:"rejected_active_limit"`
+	RejectedNewRateLimit       uint64         `json:"rejected_new_rate_limit"`
+	RejectedUserTotalLimit     uint64         `json:"rejected_user_total_limit"`
+	RejectedOnlineIPLimit      uint64         `json:"rejected_online_ip_limit"`
+	RejectedGlobalTotalLimit   uint64         `json:"rejected_global_total_limit"`
+	MaxInboundOnlineIPs        *int           `json:"max_inbound_online_ips"`
+	MaxTotalConnections        *int64         `json:"max_total_connections"`
+	MaxOutboundTCPActive       *int64         `json:"max_outbound_tcp_active"`
+	MaxOutboundTCPNewPerSecond *int           `json:"max_outbound_tcp_new_per_second"`
+	CloseWaitTimeoutSeconds    *int64         `json:"close_wait_timeout_seconds"`
 }
 
 type LimitReason string
 
 const (
-	ActiveLimit  LimitReason = "active_limit"
-	NewRateLimit LimitReason = "new_rate_limit"
+	ActiveLimit      LimitReason = "active_limit"
+	NewRateLimit     LimitReason = "new_rate_limit"
+	UserTotalLimit   LimitReason = "user_total_limit"
+	OnlineIPLimit    LimitReason = "online_ip_limit"
+	GlobalTotalLimit LimitReason = "global_total_limit"
 )
 
 type LimitError struct {
@@ -67,30 +110,64 @@ type LimitError struct {
 }
 
 func (e *LimitError) Error() string {
-	return fmt.Sprintf("outbound connection %s reached for inbound %q user %q (limit %d)", e.Reason, e.Identity.InboundTag, e.Identity.User, e.Limit)
+	return fmt.Sprintf("connection %s reached for inbound %q user %q (limit %d)", e.Reason, e.Identity.InboundTag, e.Identity.User, e.Limit)
 }
 
 type state struct {
 	snapshot     Snapshot
 	attemptTimes []time.Time
 	newTimes     []time.Time
+	sourceActive map[string]int64
+	sourceSeen   map[string]time.Time
+}
+
+type socketDirection uint8
+
+const (
+	inboundSocket socketDirection = iota + 1
+	outboundSocket
+)
+
+type socketTuple struct {
+	LocalIP    netip.Addr
+	LocalPort  uint16
+	RemoteIP   netip.Addr
+	RemotePort uint16
+}
+
+type socketRecord struct {
+	ID        uint64
+	Identity  Identity
+	Direction socketDirection
+	Tuple     socketTuple
+	ClosedAt  time.Time
 }
 
 type Manager struct {
-	mu        sync.Mutex
-	limits    map[Identity]Limit
-	states    map[Identity]*state
-	defaultCW *int64
-	now       func() time.Time
+	mu             sync.Mutex
+	limits         map[Identity]Limit
+	states         map[Identity]*state
+	defaultCW      *int64
+	onlineIPGrace  time.Duration
+	globalLimit    *int64
+	globalCurrent  int64
+	globalRejected uint64
+	sockets        map[uint64]socketRecord
+	nextSocketID   uint64
+	scanSockets    func() (map[socketTuple]string, error)
+	now            func() time.Time
 }
 
 var Default = NewManager()
 
 func NewManager() *Manager {
 	return &Manager{
-		limits: make(map[Identity]Limit),
-		states: make(map[Identity]*state),
-		now:    time.Now,
+		limits:        make(map[Identity]Limit),
+		states:        make(map[Identity]*state),
+		onlineIPGrace: 30 * time.Second,
+		sockets:       make(map[uint64]socketRecord),
+		scanSockets:   readKernelTCPSockets,
+		now:           time.Now,
 	}
 }
 
@@ -111,11 +188,23 @@ func (m *Manager) Reset() {
 	m.limits = make(map[Identity]Limit)
 	m.states = make(map[Identity]*state)
 	m.defaultCW = nil
+	m.onlineIPGrace = 30 * time.Second
+	m.globalLimit = nil
+	m.globalCurrent = 0
+	m.globalRejected = 0
+	m.sockets = make(map[uint64]socketRecord)
+	m.nextSocketID = 0
 	m.mu.Unlock()
 }
 
 func (m *Manager) ReplaceConfig(config Config) error {
 	if err := validateOptionalNonNegative("default_close_wait_timeout_seconds", config.DefaultCloseWaitTimeoutSeconds); err != nil {
+		return err
+	}
+	if config.OnlineIPGracePeriodSeconds < 0 || config.OnlineIPGracePeriodSeconds > 3600 {
+		return fmt.Errorf("online_ip_grace_period_seconds must be between 0 and 3600")
+	}
+	if err := validateOptionalPositive("max_global_total_connections", config.MaxGlobalTotalConnections); err != nil {
 		return err
 	}
 	replacement := make(map[Identity]Limit, len(config.Limits))
@@ -124,6 +213,12 @@ func (m *Manager) ReplaceConfig(config Config) error {
 			return fmt.Errorf("limit identity requires inbound_tag and user")
 		}
 		if err := validateOptionalPositive("max_outbound_tcp_active", limit.MaxOutboundTCPActive); err != nil {
+			return err
+		}
+		if limit.MaxInboundOnlineIPs != nil && *limit.MaxInboundOnlineIPs <= 0 {
+			return fmt.Errorf("max_inbound_online_ips must be positive when set")
+		}
+		if err := validateOptionalPositive("max_total_connections", limit.MaxTotalConnections); err != nil {
 			return err
 		}
 		if limit.MaxOutboundTCPNewPerSecond != nil && *limit.MaxOutboundTCPNewPerSecond <= 0 {
@@ -137,6 +232,11 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	m.mu.Lock()
 	m.limits = replacement
 	m.defaultCW = cloneInt64(config.DefaultCloseWaitTimeoutSeconds)
+	m.globalLimit = cloneInt64(config.MaxGlobalTotalConnections)
+	m.onlineIPGrace = time.Duration(config.OnlineIPGracePeriodSeconds) * time.Second
+	if m.onlineIPGrace <= 0 {
+		m.onlineIPGrace = 30 * time.Second
+	}
 	for identity, item := range m.states {
 		m.applyLimitLocked(&item.snapshot, replacement[identity])
 	}
@@ -175,6 +275,8 @@ func cloneInt(value *int) *int {
 }
 
 func cloneLimit(limit Limit) Limit {
+	limit.MaxInboundOnlineIPs = cloneInt(limit.MaxInboundOnlineIPs)
+	limit.MaxTotalConnections = cloneInt64(limit.MaxTotalConnections)
 	limit.MaxOutboundTCPActive = cloneInt64(limit.MaxOutboundTCPActive)
 	limit.MaxOutboundTCPNewPerSecond = cloneInt(limit.MaxOutboundTCPNewPerSecond)
 	limit.CloseWaitTimeoutSeconds = cloneInt64(limit.CloseWaitTimeoutSeconds)
@@ -182,6 +284,8 @@ func cloneLimit(limit Limit) Limit {
 }
 
 func (m *Manager) applyLimitLocked(snapshot *Snapshot, limit Limit) {
+	snapshot.MaxInboundOnlineIPs = cloneInt(limit.MaxInboundOnlineIPs)
+	snapshot.MaxTotalConnections = cloneInt64(limit.MaxTotalConnections)
 	snapshot.MaxOutboundTCPActive = cloneInt64(limit.MaxOutboundTCPActive)
 	snapshot.MaxOutboundTCPNewPerSecond = cloneInt(limit.MaxOutboundTCPNewPerSecond)
 	timeout := limit.CloseWaitTimeoutSeconds
@@ -189,6 +293,48 @@ func (m *Manager) applyLimitLocked(snapshot *Snapshot, limit Limit) {
 		timeout = m.defaultCW
 	}
 	snapshot.CloseWaitTimeoutSeconds = cloneInt64(timeout)
+}
+
+func newState(snapshot Snapshot) *state {
+	return &state{snapshot: snapshot, sourceActive: make(map[string]int64), sourceSeen: make(map[string]time.Time)}
+}
+
+func (m *Manager) stateLocked(identity Identity, metadata Snapshot) *state {
+	item := m.states[identity]
+	if item == nil {
+		item = newState(metadata)
+		m.states[identity] = item
+	} else {
+		mergeMetadata(&item.snapshot, metadata)
+		if item.sourceActive == nil {
+			item.sourceActive = make(map[string]int64)
+		}
+		if item.sourceSeen == nil {
+			item.sourceSeen = make(map[string]time.Time)
+		}
+	}
+	return item
+}
+
+func currentTotal(snapshot Snapshot) int64 {
+	return snapshot.InboundActive + snapshot.OutboundActive + snapshot.OutboundPending
+}
+
+func (m *Manager) rejectLocked(item *state, identity Identity, reason LimitReason, limit int64) error {
+	switch reason {
+	case UserTotalLimit:
+		item.snapshot.RejectedUserTotalLimit++
+	case OnlineIPLimit:
+		item.snapshot.RejectedOnlineIPLimit++
+	case GlobalTotalLimit:
+		item.snapshot.RejectedGlobalTotalLimit++
+		m.globalRejected++
+	case ActiveLimit:
+		item.snapshot.RejectedActiveLimit++
+	case NewRateLimit:
+		item.snapshot.RejectedNewRateLimit++
+	}
+	return &LimitError{Identity: identity, Reason: reason, Limit: limit}
 }
 
 func prune(values []time.Time, cutoff time.Time) []time.Time {
@@ -242,27 +388,26 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	key := identity.Identity
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	item := m.states[key]
-	if item == nil {
-		item = &state{snapshot: identity}
-		m.states[key] = item
-	} else {
-		mergeMetadata(&item.snapshot, identity)
-	}
+	item := m.stateLocked(key, identity)
 	limit := m.limits[key]
 	m.applyLimitLocked(&item.snapshot, limit)
+	if identity.Attributed && limit.MaxTotalConnections != nil && currentTotal(item.snapshot) >= *limit.MaxTotalConnections {
+		return nil, m.rejectLocked(item, key, UserTotalLimit, *limit.MaxTotalConnections)
+	}
 	if identity.Attributed && limit.MaxOutboundTCPActive != nil && item.snapshot.OutboundActive+item.snapshot.OutboundPending >= *limit.MaxOutboundTCPActive {
-		item.snapshot.RejectedActiveLimit++
-		return nil, &LimitError{Identity: key, Reason: ActiveLimit, Limit: *limit.MaxOutboundTCPActive}
+		return nil, m.rejectLocked(item, key, ActiveLimit, *limit.MaxOutboundTCPActive)
 	}
 	cutoff := now.Add(-time.Second)
 	item.attemptTimes = prune(item.attemptTimes, cutoff)
 	if identity.Attributed && limit.MaxOutboundTCPNewPerSecond != nil && len(item.attemptTimes) >= *limit.MaxOutboundTCPNewPerSecond {
-		item.snapshot.RejectedNewRateLimit++
-		return nil, &LimitError{Identity: key, Reason: NewRateLimit, Limit: int64(*limit.MaxOutboundTCPNewPerSecond)}
+		return nil, m.rejectLocked(item, key, NewRateLimit, int64(*limit.MaxOutboundTCPNewPerSecond))
+	}
+	if m.globalLimit != nil && m.globalCurrent >= *m.globalLimit {
+		return nil, m.rejectLocked(item, key, GlobalTotalLimit, *m.globalLimit)
 	}
 	item.attemptTimes = append(item.attemptTimes, now)
 	item.snapshot.OutboundPending++
+	m.globalCurrent++
 	return &lease{manager: m, identity: key, timeout: secondsToDuration(item.snapshot.CloseWaitTimeoutSeconds)}, nil
 }
 
@@ -292,6 +437,9 @@ func (l *lease) failed() {
 	l.manager.mu.Lock()
 	if item := l.manager.states[l.identity]; item != nil && item.snapshot.OutboundPending > 0 {
 		item.snapshot.OutboundPending--
+		if l.manager.globalCurrent > 0 {
+			l.manager.globalCurrent--
+		}
 	}
 	l.manager.mu.Unlock()
 }
@@ -302,6 +450,7 @@ func (l *lease) succeeded(conn stdnet.Conn) stdnet.Conn {
 	}
 	now := l.manager.now()
 	l.manager.mu.Lock()
+	var socketID uint64
 	if item := l.manager.states[l.identity]; item != nil {
 		if item.snapshot.OutboundPending > 0 {
 			item.snapshot.OutboundPending--
@@ -309,58 +458,241 @@ func (l *lease) succeeded(conn stdnet.Conn) stdnet.Conn {
 		item.snapshot.OutboundActive++
 		item.snapshot.OutboundNewTotal++
 		item.newTimes = append(item.newTimes, now)
+		if tuple, ok := socketTupleFromConn(conn); ok {
+			socketID = l.manager.registerSocketLocked(l.identity, outboundSocket, tuple)
+		}
 	}
 	l.manager.mu.Unlock()
-	return &trackedOutboundConn{Conn: conn, release: func() { l.manager.release(l.identity) }, closeWaitTimeout: l.timeout}
+	return &trackedOutboundConn{Conn: conn, release: func() { l.manager.releaseOutbound(l.identity, socketID) }, closeWaitTimeout: l.timeout}
 }
 
-func (m *Manager) release(identity Identity) {
+func (m *Manager) releaseOutbound(identity Identity, socketID uint64) {
 	m.mu.Lock()
 	if item := m.states[identity]; item != nil && item.snapshot.OutboundActive > 0 {
 		item.snapshot.OutboundActive--
+		if m.globalCurrent > 0 {
+			m.globalCurrent--
+		}
 	}
+	m.closeSocketLocked(socketID)
 	m.mu.Unlock()
 }
 
-func (m *Manager) bindInbound(identity Snapshot) {
+func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, error) {
 	key := identity.Identity
+	now := m.now()
 	m.mu.Lock()
-	item := m.states[key]
-	if item == nil {
-		item = &state{snapshot: identity}
-		m.states[key] = item
-	} else {
-		mergeMetadata(&item.snapshot, identity)
+	defer m.mu.Unlock()
+	item := m.stateLocked(key, identity)
+	limit := m.limits[key]
+	m.applyLimitLocked(&item.snapshot, limit)
+	if limit.MaxTotalConnections != nil && currentTotal(item.snapshot) >= *limit.MaxTotalConnections {
+		return 0, m.rejectLocked(item, key, UserTotalLimit, *limit.MaxTotalConnections)
+	}
+	source := normalizedSourceIP(tuple.RemoteIP)
+	m.pruneSourcesLocked(item, now)
+	if source != "" && limit.MaxInboundOnlineIPs != nil && item.sourceActive[source] == 0 {
+		if _, retained := item.sourceSeen[source]; !retained && len(item.sourceSeen) >= *limit.MaxInboundOnlineIPs {
+			return 0, m.rejectLocked(item, key, OnlineIPLimit, int64(*limit.MaxInboundOnlineIPs))
+		}
+	}
+	if m.globalLimit != nil && m.globalCurrent >= *m.globalLimit {
+		return 0, m.rejectLocked(item, key, GlobalTotalLimit, *m.globalLimit)
 	}
 	item.snapshot.InboundActive++
 	item.snapshot.InboundTotal++
-	m.applyLimitLocked(&item.snapshot, m.limits[key])
-	m.mu.Unlock()
+	m.globalCurrent++
+	if source != "" {
+		item.sourceActive[source]++
+		item.sourceSeen[source] = now
+	}
+	return m.registerSocketLocked(key, inboundSocket, tuple), nil
 }
 
-func (m *Manager) releaseInbound(identity Identity) {
+func (m *Manager) releaseInbound(identity Identity, socketID uint64, source string) {
 	m.mu.Lock()
 	if item := m.states[identity]; item != nil && item.snapshot.InboundActive > 0 {
 		item.snapshot.InboundActive--
+		if m.globalCurrent > 0 {
+			m.globalCurrent--
+		}
+		if source != "" {
+			if item.sourceActive[source] > 0 {
+				item.sourceActive[source]--
+			}
+			item.sourceSeen[source] = m.now()
+		}
 	}
+	m.closeSocketLocked(socketID)
 	m.mu.Unlock()
 }
 
-func (m *Manager) Snapshots() []Snapshot {
+func (m *Manager) registerSocketLocked(identity Identity, direction socketDirection, tuple socketTuple) uint64 {
+	if !tuple.valid() {
+		return 0
+	}
+	m.nextSocketID++
+	m.sockets[m.nextSocketID] = socketRecord{ID: m.nextSocketID, Identity: identity, Direction: direction, Tuple: tuple}
+	return m.nextSocketID
+}
+
+func (m *Manager) closeSocketLocked(socketID uint64) {
+	if socketID == 0 {
+		return
+	}
+	record, ok := m.sockets[socketID]
+	if !ok || !record.ClosedAt.IsZero() {
+		return
+	}
+	record.ClosedAt = m.now()
+	m.sockets[socketID] = record
+}
+
+func (m *Manager) pruneSourcesLocked(item *state, now time.Time) {
+	cutoff := now.Add(-m.onlineIPGrace)
+	for source, seen := range item.sourceSeen {
+		if item.sourceActive[source] <= 0 && !seen.After(cutoff) {
+			delete(item.sourceSeen, source)
+			delete(item.sourceActive, source)
+		}
+	}
+}
+
+func normalizedSourceIP(address netip.Addr) string {
+	if !address.IsValid() || address.IsUnspecified() {
+		return ""
+	}
+	address = address.Unmap()
+	if address.Is6() {
+		return netip.PrefixFrom(address, 64).Masked().String()
+	}
+	return address.String()
+}
+
+func socketTupleFromConn(conn stdnet.Conn) (socketTuple, bool) {
+	local, localOK := tcpAddrPort(conn.LocalAddr())
+	remote, remoteOK := tcpAddrPort(conn.RemoteAddr())
+	if !localOK || !remoteOK {
+		return socketTuple{}, false
+	}
+	tuple := socketTuple{LocalIP: local.Addr().Unmap(), LocalPort: local.Port(), RemoteIP: remote.Addr().Unmap(), RemotePort: remote.Port()}
+	return tuple, tuple.valid()
+}
+
+func tcpAddrPort(address stdnet.Addr) (netip.AddrPort, bool) {
+	tcp, ok := address.(*stdnet.TCPAddr)
+	if !ok || tcp == nil {
+		return netip.AddrPort{}, false
+	}
+	ip, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok || tcp.Port < 1 || tcp.Port > 65535 {
+		return netip.AddrPort{}, false
+	}
+	return netip.AddrPortFrom(ip.Unmap(), uint16(tcp.Port)), true
+}
+
+func (tuple socketTuple) valid() bool {
+	return tuple.LocalIP.IsValid() && tuple.RemoteIP.IsValid() && tuple.LocalPort > 0 && tuple.RemotePort > 0
+}
+
+func addTCPState(counts *TCPStateCounts, state string) {
+	if state == tcpListenState {
+		return
+	}
+	counts.Total++
+	switch state {
+	case tcpEstablishedState:
+		counts.Established++
+	case tcpSynSentState:
+		counts.SynSent++
+	case tcpSynRecvState, tcpNewSynRecvState:
+		counts.SynRecv++
+	case tcpFinWait1State:
+		counts.FinWait1++
+	case tcpFinWait2State:
+		counts.FinWait2++
+	case tcpTimeWaitState:
+		counts.TimeWait++
+	case tcpCloseWaitState:
+		counts.CloseWait++
+	case tcpLastAckState:
+		counts.LastAck++
+	case tcpClosingState:
+		counts.Closing++
+	case tcpCloseState:
+		counts.Close++
+	default:
+		counts.Unknown++
+	}
+}
+
+func (m *Manager) SnapshotReport() ([]Snapshot, GlobalSnapshot, error) {
 	now := m.now()
 	cutoff := now.Add(-time.Second)
+	kernelSockets, err := m.scanSockets()
+	if err != nil {
+		return nil, GlobalSnapshot{}, fmt.Errorf("read kernel TCP states: %w", err)
+	}
 	m.mu.Lock()
 	result := make([]Snapshot, 0, len(m.states))
-	for _, item := range m.states {
+	for identity, item := range m.states {
 		item.newTimes = prune(item.newTimes, cutoff)
+		m.pruneSourcesLocked(item, now)
+		item.snapshot.InboundTCP = TCPStateCounts{}
+		item.snapshot.OutboundTCP = TCPStateCounts{}
+		item.snapshot.InboundOnlineIPs = nil
+		item.snapshot.CurrentTotal = currentTotal(item.snapshot)
+		for source, seen := range item.sourceSeen {
+			if item.sourceActive[source] > 0 || seen.After(now.Add(-m.onlineIPGrace)) {
+				item.snapshot.InboundOnlineIPs = append(item.snapshot.InboundOnlineIPs, OnlineIP{IP: source, Connections: item.sourceActive[source]})
+			}
+		}
+		sort.Slice(item.snapshot.InboundOnlineIPs, func(i, j int) bool {
+			return item.snapshot.InboundOnlineIPs[i].IP < item.snapshot.InboundOnlineIPs[j].IP
+		})
 		copy := item.snapshot
 		copy.OutboundNewRate = len(item.newTimes)
-		copy.OutboundRejectedTotal = copy.RejectedActiveLimit + copy.RejectedNewRateLimit
+		copy.OutboundRejectedTotal = copy.RejectedActiveLimit + copy.RejectedNewRateLimit + copy.RejectedUserTotalLimit + copy.RejectedOnlineIPLimit + copy.RejectedGlobalTotalLimit
+		copy.MaxInboundOnlineIPs = cloneInt(copy.MaxInboundOnlineIPs)
+		copy.MaxTotalConnections = cloneInt64(copy.MaxTotalConnections)
 		copy.MaxOutboundTCPActive = cloneInt64(copy.MaxOutboundTCPActive)
 		copy.MaxOutboundTCPNewPerSecond = cloneInt(copy.MaxOutboundTCPNewPerSecond)
 		copy.CloseWaitTimeoutSeconds = cloneInt64(copy.CloseWaitTimeoutSeconds)
+		copy.InboundOnlineIPs = append([]OnlineIP(nil), copy.InboundOnlineIPs...)
 		result = append(result, copy)
+		m.states[identity] = item
 	}
+	for socketID, record := range m.sockets {
+		stateCode, found := kernelSockets[record.Tuple]
+		if !found {
+			if !record.ClosedAt.IsZero() && now.Sub(record.ClosedAt) >= 10*time.Second {
+				delete(m.sockets, socketID)
+			}
+			continue
+		}
+		item := m.states[record.Identity]
+		if item == nil {
+			continue
+		}
+		if record.Direction == inboundSocket {
+			addTCPState(&item.snapshot.InboundTCP, stateCode)
+		} else {
+			addTCPState(&item.snapshot.OutboundTCP, stateCode)
+		}
+	}
+	// Socket-state aggregation updates the live snapshots after the first copy.
+	// Refresh those two fields without disturbing the rate snapshot taken above.
+	byIdentity := make(map[Identity]int, len(result))
+	for index := range result {
+		byIdentity[result[index].Identity] = index
+	}
+	for identity, item := range m.states {
+		if index, ok := byIdentity[identity]; ok {
+			result[index].InboundTCP = item.snapshot.InboundTCP
+			result[index].OutboundTCP = item.snapshot.OutboundTCP
+		}
+	}
+	global := GlobalSnapshot{CurrentTotal: m.globalCurrent, MaxTotal: cloneInt64(m.globalLimit), RejectedGlobalTotalLimit: m.globalRejected}
 	m.mu.Unlock()
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Identity.InboundTag != result[j].Identity.InboundTag {
@@ -368,7 +700,12 @@ func (m *Manager) Snapshots() []Snapshot {
 		}
 		return result[i].Identity.User < result[j].Identity.User
 	})
-	return result
+	return result, global, nil
+}
+
+func (m *Manager) Snapshots() []Snapshot {
+	snapshots, _, _ := m.SnapshotReport()
+	return snapshots
 }
 
 // TrackDial wraps the single physical TCP dial selected by Xray. UDP bypasses
@@ -391,8 +728,12 @@ type trackedInboundConn struct {
 	manager   *Manager
 	mu        sync.Mutex
 	identity  Identity
+	tuple     socketTuple
+	socketID  uint64
+	source    string
 	bound     bool
 	closed    bool
+	rejectErr error
 	closeOnce sync.Once
 }
 
@@ -400,31 +741,45 @@ func TrackInbound(conn stdnet.Conn) stdnet.Conn {
 	if conn == nil {
 		return nil
 	}
-	return &trackedInboundConn{Conn: conn, manager: Default}
+	tuple, _ := socketTupleFromConn(conn)
+	return &trackedInboundConn{Conn: conn, manager: Default, tuple: tuple}
 }
 
-func BindInbound(ctx context.Context, conn stdnet.Conn) {
+func BindInbound(ctx context.Context, conn stdnet.Conn) error {
 	tracked, ok := conn.(*trackedInboundConn)
 	if !ok || tracked == nil {
-		return
+		return nil
 	}
 	identity := identityFromContext(ctx)
 	if !identity.Attributed {
-		return
+		return nil
 	}
-	tracked.bind(identity)
+	return tracked.bind(identity)
 }
 
-func (c *trackedInboundConn) bind(identity Snapshot) {
+func (c *trackedInboundConn) bind(identity Snapshot) error {
 	c.mu.Lock()
+	if c.rejectErr != nil {
+		err := c.rejectErr
+		c.mu.Unlock()
+		return err
+	}
 	if c.bound || c.closed {
 		c.mu.Unlock()
-		return
+		return nil
+	}
+	socketID, err := c.manager.bindInbound(identity, c.tuple)
+	if err != nil {
+		c.rejectErr = err
+		c.mu.Unlock()
+		return err
 	}
 	c.bound = true
 	c.identity = identity.Identity
+	c.socketID = socketID
+	c.source = normalizedSourceIP(c.tuple.RemoteIP)
 	c.mu.Unlock()
-	c.manager.bindInbound(identity)
+	return nil
 }
 
 func (c *trackedInboundConn) Close() error {
@@ -434,9 +789,11 @@ func (c *trackedInboundConn) Close() error {
 		c.closed = true
 		bound := c.bound
 		identity := c.identity
+		socketID := c.socketID
+		source := c.source
 		c.mu.Unlock()
 		if bound {
-			c.manager.releaseInbound(identity)
+			c.manager.releaseInbound(identity, socketID, source)
 		}
 	})
 	return err

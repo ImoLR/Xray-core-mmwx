@@ -158,7 +158,6 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
-		customconnection.BindInbound(ctx, sessionInbound.Conn)
 	}
 
 	if user != nil && len(user.Email) > 0 {
@@ -200,7 +199,6 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 	var user *protocol.MemoryUser
 	if sessionInbound != nil {
 		user = sessionInbound.User
-		customconnection.BindInbound(ctx, sessionInbound.Conn)
 	}
 
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
@@ -285,6 +283,11 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
+		if err := customconnection.BindInbound(ctx, inbound.Conn); err != nil {
+			return nil, errors.New("inbound connection rejected by custom connection control").Base(err)
+		}
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -341,6 +344,11 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
+	}
+	if inbound := session.InboundFromContext(ctx); inbound != nil {
+		if err := customconnection.BindInbound(ctx, inbound.Conn); err != nil {
+			return errors.New("inbound connection rejected by custom connection control").Base(err)
+		}
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {

@@ -19,9 +19,10 @@ const (
 )
 
 type controlSnapshot struct {
-	Version   int        `json:"version"`
-	StartedAt time.Time  `json:"started_at"`
-	Users     []Snapshot `json:"proxy_users"`
+	Version   int            `json:"version"`
+	StartedAt time.Time      `json:"started_at"`
+	Global    GlobalSnapshot `json:"global"`
+	Users     []Snapshot     `json:"proxy_users"`
 }
 
 var controlRuntime struct {
@@ -91,14 +92,19 @@ func newControlServer(manager *Manager) *http.Server {
 			writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		writeControlJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": 1})
+		writeControlJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": 2})
 	})
 	mux.HandleFunc("/v1/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 1, StartedAt: startedAt, Users: manager.Snapshots()})
+		users, global, err := manager.SnapshotReport()
+		if err != nil {
+			writeControlJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
+			return
+		}
+		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 2, StartedAt: startedAt, Global: global, Users: users})
 	})
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
