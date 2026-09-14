@@ -14,6 +14,7 @@ import (
 
 func TestControlServerSnapshotAndConfig(t *testing.T) {
 	manager := NewManager()
+	manager.RegisterConfiguredInbound(ConfiguredInbound{Tag: "in-a", Name: "shadowsocks-2022-multi", Port: 10015, Users: []string{"user-a"}})
 	server := newControlServer(manager)
 	request := httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
 	response := httptest.NewRecorder()
@@ -40,7 +41,7 @@ func TestControlServerSnapshotAndConfig(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
 	response = httptest.NewRecorder()
 	server.Handler.ServeHTTP(response, request)
-	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":2`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) {
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":2`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) {
 		t.Fatalf("v2 snapshot/global fields missing: %s", response.Body.String())
 	}
 }

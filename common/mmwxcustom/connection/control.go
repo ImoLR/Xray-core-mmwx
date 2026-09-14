@@ -19,10 +19,11 @@ const (
 )
 
 type controlSnapshot struct {
-	Version   int            `json:"version"`
-	StartedAt time.Time      `json:"started_at"`
-	Global    GlobalSnapshot `json:"global"`
-	Users     []Snapshot     `json:"proxy_users"`
+	Version   int                 `json:"version"`
+	StartedAt time.Time           `json:"started_at"`
+	Global    GlobalSnapshot      `json:"global"`
+	Inbounds  []ConfiguredInbound `json:"inbounds"`
+	Users     []Snapshot          `json:"proxy_users"`
 }
 
 var controlRuntime struct {
@@ -104,7 +105,7 @@ func newControlServer(manager *Manager) *http.Server {
 			writeControlJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 			return
 		}
-		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 2, StartedAt: startedAt, Global: global, Users: users})
+		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 2, StartedAt: startedAt, Global: global, Inbounds: manager.ConfiguredInbounds(), Users: users})
 	})
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {

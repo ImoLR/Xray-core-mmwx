@@ -41,6 +41,8 @@ type MultiUserInbound struct {
 	service  *shadowaead_2022.MultiService[int]
 }
 
+func (i *MultiUserInbound) ConnectionInboundName() string { return "shadowsocks-2022-multi" }
+
 func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiUserInbound, error) {
 	networks := config.Network
 	if len(networks) == 0 {

@@ -6,6 +6,7 @@ import (
 	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	customconnection "github.com/xtls/xray-core/common/mmwxcustom/connection"
 	"github.com/xtls/xray-core/common/mux"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/serial"
@@ -162,6 +163,30 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 					}
 					h.workers = append(h.workers, worker)
 				}
+			}
+		}
+	}
+
+	name := ""
+	if named, ok := p.(interface{ ConnectionInboundName() string }); ok {
+		name = named.ConnectionInboundName()
+	}
+	var users []string
+	if manager, ok := p.(proxy.UserManager); ok {
+		for _, user := range manager.GetUsers(ctx) {
+			if user != nil && user.Email != "" {
+				users = append(users, user.Email)
+			}
+		}
+	} else if provider, ok := p.(interface{ ConnectionUsers() []string }); ok {
+		users = append(users, provider.ConnectionUsers()...)
+	}
+	if pl != nil {
+		for _, pr := range pl.Range {
+			for port := pr.From; port <= pr.To; port++ {
+				customconnection.RegisterConfiguredInbound(customconnection.ConfiguredInbound{
+					Tag: tag, Name: name, Port: port, Users: users,
+				})
 			}
 		}
 	}

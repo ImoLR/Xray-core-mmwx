@@ -178,6 +178,32 @@ func TestInboundIdentityPropagationAndReset(t *testing.T) {
 	}
 }
 
+func TestConfiguredInboundAndUsersExistBeforeTraffic(t *testing.T) {
+	manager := NewManager()
+	manager.RegisterConfiguredInbound(ConfiguredInbound{
+		Tag: "ss-10015", Name: "shadowsocks-2022-multi", Port: 10015,
+		Users: []string{"user-b", "user-a", "user-a", ""},
+	})
+	manager.RegisterConfiguredInbound(ConfiguredInbound{
+		Tag: "ss-12311", Name: "shadowsocks-2022", Port: 12311,
+	})
+
+	inbounds := manager.ConfiguredInbounds()
+	if len(inbounds) != 2 || inbounds[0].Port != 10015 || len(inbounds[0].Users) != 2 || inbounds[0].Users[0] != "user-a" || inbounds[1].Port != 12311 {
+		t.Fatalf("configured inbounds = %#v", inbounds)
+	}
+	for _, user := range []string{"user-a", "user-b"} {
+		got := findSnapshot(t, manager, Identity{InboundTag: "ss-10015", User: user})
+		if !got.Attributed || got.InboundPort != 10015 || got.InboundActive != 0 || got.CurrentTotal != 0 {
+			t.Fatalf("pre-traffic user %q = %#v", user, got)
+		}
+	}
+	manager.Reset()
+	if len(manager.ConfiguredInbounds()) != 0 || len(manager.Snapshots()) != 0 {
+		t.Fatal("reset retained configured runtime metadata")
+	}
+}
+
 type eofConn struct {
 	closed chan struct{}
 	once   sync.Once

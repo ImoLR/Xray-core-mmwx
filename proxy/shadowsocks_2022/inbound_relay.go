@@ -38,6 +38,18 @@ type RelayInbound struct {
 	service      *shadowaead_2022.RelayService[int]
 }
 
+func (i *RelayInbound) ConnectionInboundName() string { return "shadowsocks-2022-relay" }
+
+func (i *RelayInbound) ConnectionUsers() []string {
+	users := make([]string, 0, len(i.destinations))
+	for _, destination := range i.destinations {
+		if destination != nil && destination.Email != "" {
+			users = append(users, destination.Email)
+		}
+	}
+	return users
+}
+
 func NewRelayServer(ctx context.Context, config *RelayServerConfig) (*RelayInbound, error) {
 	networks := config.Network
 	if len(networks) == 0 {

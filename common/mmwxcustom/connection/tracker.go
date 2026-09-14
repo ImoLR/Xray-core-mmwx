@@ -58,6 +58,16 @@ type OnlineIP struct {
 	Connections int64  `json:"connections"`
 }
 
+// ConfiguredInbound describes an inbound known from Xray's loaded runtime
+// configuration. It is kept separately from live socket accounting so a new
+// Core can expose inbounds and authenticated users before their first request.
+type ConfiguredInbound struct {
+	Tag   string   `json:"inbound_tag"`
+	Name  string   `json:"inbound_name,omitempty"`
+	Port  uint32   `json:"inbound_port"`
+	Users []string `json:"users"`
+}
+
 type GlobalSnapshot struct {
 	CurrentTotal             int64  `json:"current_total"`
 	MaxTotal                 *int64 `json:"max_total"`
@@ -147,6 +157,7 @@ type Manager struct {
 	mu             sync.Mutex
 	limits         map[Identity]Limit
 	states         map[Identity]*state
+	inbounds       map[string]ConfiguredInbound
 	defaultCW      *int64
 	onlineIPGrace  time.Duration
 	globalLimit    *int64
@@ -164,6 +175,7 @@ func NewManager() *Manager {
 	return &Manager{
 		limits:        make(map[Identity]Limit),
 		states:        make(map[Identity]*state),
+		inbounds:      make(map[string]ConfiguredInbound),
 		onlineIPGrace: 30 * time.Second,
 		sockets:       make(map[uint64]socketRecord),
 		scanSockets:   readKernelTCPSockets,
@@ -187,6 +199,7 @@ func (m *Manager) Reset() {
 	m.mu.Lock()
 	m.limits = make(map[Identity]Limit)
 	m.states = make(map[Identity]*state)
+	m.inbounds = make(map[string]ConfiguredInbound)
 	m.defaultCW = nil
 	m.onlineIPGrace = 30 * time.Second
 	m.globalLimit = nil
@@ -195,6 +208,66 @@ func (m *Manager) Reset() {
 	m.sockets = make(map[uint64]socketRecord)
 	m.nextSocketID = 0
 	m.mu.Unlock()
+}
+
+// RegisterConfiguredInbound records the inbounds and users present in the
+// configuration that Xray actually instantiated. Live counters remain zero
+// until traffic arrives, while identity and inbound discovery are immediate.
+func RegisterConfiguredInbound(inbound ConfiguredInbound) {
+	Default.RegisterConfiguredInbound(inbound)
+}
+
+func (m *Manager) RegisterConfiguredInbound(inbound ConfiguredInbound) {
+	if inbound.Tag == "" || inbound.Port == 0 {
+		return
+	}
+	seen := make(map[string]struct{}, len(inbound.Users))
+	users := make([]string, 0, len(inbound.Users))
+	for _, user := range inbound.Users {
+		if user == "" {
+			continue
+		}
+		if _, exists := seen[user]; exists {
+			continue
+		}
+		seen[user] = struct{}{}
+		users = append(users, user)
+	}
+	sort.Strings(users)
+	inbound.Users = users
+	key := fmt.Sprintf("%s\x00%d", inbound.Tag, inbound.Port)
+
+	m.mu.Lock()
+	if m.inbounds == nil {
+		m.inbounds = make(map[string]ConfiguredInbound)
+	}
+	m.inbounds[key] = inbound
+	for _, user := range users {
+		identity := Identity{InboundTag: inbound.Tag, User: user}
+		item := m.stateLocked(identity, Snapshot{
+			Identity: identity, InboundName: inbound.Name, InboundPort: inbound.Port, Attributed: true,
+		})
+		m.applyLimitLocked(&item.snapshot, m.limits[identity])
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) ConfiguredInbounds() []ConfiguredInbound {
+	m.mu.Lock()
+	result := make([]ConfiguredInbound, 0, len(m.inbounds))
+	for _, inbound := range m.inbounds {
+		copy := inbound
+		copy.Users = append([]string(nil), inbound.Users...)
+		result = append(result, copy)
+	}
+	m.mu.Unlock()
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Port != result[j].Port {
+			return result[i].Port < result[j].Port
+		}
+		return result[i].Tag < result[j].Tag
+	})
+	return result
 }
 
 func (m *Manager) ReplaceConfig(config Config) error {

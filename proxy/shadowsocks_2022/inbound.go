@@ -36,6 +36,15 @@ type Inbound struct {
 	level    int
 }
 
+func (i *Inbound) ConnectionInboundName() string { return "shadowsocks-2022" }
+
+func (i *Inbound) ConnectionUsers() []string {
+	if i.email == "" {
+		return nil
+	}
+	return []string{i.email}
+}
+
 func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 	networks := config.Network
 	if len(networks) == 0 {
