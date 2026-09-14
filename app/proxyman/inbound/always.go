@@ -167,10 +167,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 		}
 	}
 
-	name := ""
-	if named, ok := p.(interface{ ConnectionInboundName() string }); ok {
-		name = named.ConnectionInboundName()
-	}
+	name, tracked := configuredInboundName(p)
 	var users []string
 	if manager, ok := p.(proxy.UserManager); ok {
 		for _, user := range manager.GetUsers(ctx) {
@@ -181,7 +178,7 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	} else if provider, ok := p.(interface{ ConnectionUsers() []string }); ok {
 		users = append(users, provider.ConnectionUsers()...)
 	}
-	if pl != nil {
+	if tracked && pl != nil {
 		for _, pr := range pl.Range {
 			for port := pr.From; port <= pr.To; port++ {
 				customconnection.RegisterConfiguredInbound(customconnection.ConfiguredInbound{
@@ -192,6 +189,15 @@ func NewAlwaysOnInboundHandler(ctx context.Context, tag string, receiverConfig *
 	}
 
 	return h, nil
+}
+
+func configuredInboundName(p any) (string, bool) {
+	named, ok := p.(interface{ ConnectionInboundName() string })
+	if !ok {
+		return "", false
+	}
+	name := named.ConnectionInboundName()
+	return name, name != ""
 }
 
 // Start implements common.Runnable.
