@@ -307,7 +307,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	}
 	if _, err := manager.acquire(userContext("in-a", "user-a"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)); err == nil {
 		t.Fatal("user total limit did not reject a new resource")
-	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != UserTotalLimit {
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortTotalLimit {
 		t.Fatalf("unexpected user limit error: %v", err)
 	}
 	if _, err := manager.bindInbound(identityFromContext(userContext("in-b", "user-b")), socketTuple{}); err != nil {
@@ -320,7 +320,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	}
 	leaseA.failed()
 	got := findSnapshot(t, manager, userA)
-	if got.CurrentTotal != 1 || got.RejectedUserTotalLimit != 1 {
+	if got.CurrentTotal != 1 || got.RejectedPortTotalLimit != 1 {
 		t.Fatalf("user total snapshot mismatch: %#v", got)
 	}
 	_, global, err := manager.SnapshotReport()
@@ -382,9 +382,262 @@ func TestRejectedInboundIsCountedOnceAcrossRepeatedDispatch(t *testing.T) {
 			t.Fatal("expected repeated dispatch to retain the rejection")
 		}
 	}
-	if got := findSnapshot(t, manager, identity); got.RejectedUserTotalLimit != 1 {
+	if got := findSnapshot(t, manager, identity); got.RejectedPortTotalLimit != 1 {
 		t.Fatalf("one inbound socket produced repeated rejection counters: %#v", got)
 	}
+}
+
+func TestManagementGroupAggregateLimitIsConcurrentAcrossPorts(t *testing.T) {
+	manager := NewManager()
+	groupLimit := int64(4)
+	identities := []Identity{{InboundTag: "in-a", User: "proto-a"}, {InboundTag: "in-b", User: "proto-b"}}
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identities[0], Group: "ken"}, {Identity: identities[1], Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &groupLimit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	var accepted int
+	var acceptedMu sync.Mutex
+	var leases []*lease
+	var leaseMu sync.Mutex
+	var wait sync.WaitGroup
+	for index := 0; index < 40; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			identity := identities[index%len(identities)]
+			lease, err := manager.acquire(userContext(identity.InboundTag, identity.User), destination)
+			if err != nil {
+				return
+			}
+			acceptedMu.Lock()
+			accepted++
+			acceptedMu.Unlock()
+			leaseMu.Lock()
+			leases = append(leases, lease)
+			leaseMu.Unlock()
+		}(index)
+	}
+	wait.Wait()
+	if accepted != 4 {
+		t.Fatalf("management aggregate admitted %d, want 4", accepted)
+	}
+	for _, lease := range leases {
+		lease.failed()
+	}
+	_, _, groups, err := manager.FullSnapshotReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].Group != "ken" || groups[0].RejectedUserTotalLimit != 36 || groups[0].OutboundPending != 0 {
+		t.Fatalf("management group snapshot = %#v", groups)
+	}
+}
+
+func TestGlobalManagementAndPortLimitsAllRemainHardCeilings(t *testing.T) {
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	for _, test := range []struct {
+		name       string
+		global     int64
+		management int64
+		port       int64
+		want       LimitReason
+	}{
+		{name: "global first", global: 1, management: 3, port: 3, want: GlobalTotalLimit},
+		{name: "management second", global: 3, management: 1, port: 3, want: UserTotalLimit},
+		{name: "port third", global: 3, management: 3, port: 1, want: PortTotalLimit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager()
+			if err := manager.ReplaceConfig(Config{
+				MaxGlobalTotalConnections: &test.global,
+				ManagementMappings:        []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+				ManagementLimits:          []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &test.management}},
+				PortLimits:                []PortLimit{{InboundTag: "in-a", MaxOutboundTCPActive: &test.port}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := manager.acquire(userContext("in-a", "proto-a"), destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.acquire(userContext("in-a", "proto-a"), destination); err == nil {
+				t.Fatal("second admission exceeded a configured ceiling")
+			} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != test.want {
+				t.Fatalf("rejection reason = %v, want %s", err, test.want)
+			}
+			first.failed()
+		})
+	}
+}
+
+func TestManagementAndPortLimitsHaveDistinctReasons(t *testing.T) {
+	manager := NewManager()
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	userLimit, portLimit := int64(1), int64(1)
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &userLimit}},
+		Limits:             []Limit{{Identity: identityB, MaxOutboundTCPActive: &portLimit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	first, err := manager.acquire(userContext("in-a", "proto-a"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.acquire(userContext("in-b", "proto-b"), destination); err == nil {
+		t.Fatal("expected management user rejection")
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != UserTotalLimit || limitErr.ManagementGroup != "ken" {
+		t.Fatalf("unexpected management rejection: %v", err)
+	}
+	first.failed()
+	userLimit = 10
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &userLimit}},
+		Limits:             []Limit{{Identity: identityB, MaxOutboundTCPActive: &portLimit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.acquire(userContext("in-b", "proto-b"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.acquire(userContext("in-b", "proto-b"), destination); err == nil {
+		t.Fatal("expected port rejection")
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortTotalLimit {
+		t.Fatalf("unexpected port rejection: %v", err)
+	}
+	second.failed()
+}
+
+func TestPortAggregateLimitCannotBeBypassedByChangingProtocolIdentity(t *testing.T) {
+	manager := NewManager()
+	limit := int64(3)
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: "shared", MaxOutboundTCPActive: &limit}}}); err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	identities := []string{"proto-a", "proto-b"}
+	leasing := []*lease{}
+	for index := 0; index < 3; index++ {
+		lease, err := manager.acquire(userContext("shared", identities[index%2]), destination)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leasing = append(leasing, lease)
+	}
+	if _, err := manager.acquire(userContext("shared", "proto-b"), destination); err == nil {
+		t.Fatal("second protocol identity bypassed the port aggregate limit")
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortTotalLimit {
+		t.Fatalf("unexpected port aggregate rejection: %v", err)
+	}
+	for _, lease := range leasing {
+		lease.failed()
+	}
+}
+
+func TestManagementAndPortNewRateLimitsAreCrossPortAndDistinct(t *testing.T) {
+	manager := NewManager()
+	now := time.Unix(100, 0)
+	manager.now = func() time.Time { return now }
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	userRate, portRate := 2, 1
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPNewPerSecond: &userRate}},
+		Limits:             []Limit{{Identity: identityA, MaxOutboundTCPNewPerSecond: &portRate}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	lease, err := manager.acquire(userContext("in-a", "proto-a"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.failed()
+	if _, err := manager.acquire(userContext("in-a", "proto-a"), destination); err == nil {
+		t.Fatal("expected per-port NEW/s rejection")
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortNewRateLimit {
+		t.Fatalf("unexpected per-port NEW/s rejection: %v", err)
+	}
+	lease, err = manager.acquire(userContext("in-b", "proto-b"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease.failed()
+	if _, err := manager.acquire(userContext("in-b", "proto-b"), destination); err == nil {
+		t.Fatal("expected management NEW/s rejection")
+	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != UserNewRateLimit {
+		t.Fatalf("unexpected management NEW/s rejection: %v", err)
+	}
+}
+
+func TestSingleSecretInboundUsesExplicitTagOnlyMapping(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "ss-12311"}
+	limit := int64(1)
+	manager.RegisterConfiguredInbound(ConfiguredInbound{Tag: identity.InboundTag, Port: 12311})
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identity, Group: "imolr"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "imolr", MaxOutboundTCPActive: &limit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := session.ContextWithInbound(context.Background(), &session.Inbound{Tag: identity.InboundTag, Gateway: xnet.TCPDestination(xnet.AnyIP, 12311)})
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	lease, err := manager.acquire(ctx, destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.acquire(ctx, destination); err == nil {
+		t.Fatal("tag-only management mapping was not enforced")
+	}
+	lease.failed()
+	got := findSnapshot(t, manager, identity)
+	if !got.Attributed || got.ManagementGroup != "imolr" || got.InboundPort != 12311 {
+		t.Fatalf("tag-only mapping snapshot = %#v", got)
+	}
+}
+
+func TestMappingRemovalStopsManagementAttributionWithoutLosingPortState(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	limit := int64(1)
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identity, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &limit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	first, err := manager.acquire(userContext("in-a", "proto-a"), destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.acquire(userContext("in-a", "proto-a"), destination); err == nil {
+		t.Fatal("management limit did not apply")
+	}
+	if err := manager.ReplaceConfig(Config{}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.acquire(userContext("in-a", "proto-a"), destination)
+	if err != nil {
+		t.Fatalf("removed mapping still limited the identity: %v", err)
+	}
+	if got := findSnapshot(t, manager, identity); got.ManagementGroup != "" || got.OutboundPending != 2 {
+		t.Fatalf("mapping removal lost or misattributed port state: %#v", got)
+	}
+	first.failed()
+	second.failed()
 }
 
 func stdnetIPToAddr(value string) netip.Addr {
