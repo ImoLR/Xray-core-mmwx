@@ -42,12 +42,16 @@ type ManagementGroupMapping struct {
 
 type ManagementGroupLimit struct {
 	Group                      string `json:"group"`
+	MaxInboundConnections      *int64 `json:"max_inbound_connections"`
+	MaxInboundOnlineIPs        *int   `json:"max_inbound_online_ips"`
 	MaxOutboundTCPActive       *int64 `json:"max_outbound_tcp_active"`
 	MaxOutboundTCPNewPerSecond *int   `json:"max_outbound_tcp_new_per_second"`
 }
 
 type PortLimit struct {
 	InboundTag                 string `json:"inbound_tag"`
+	MaxInboundConnections      *int64 `json:"max_inbound_connections"`
+	MaxInboundOnlineIPs        *int   `json:"max_inbound_online_ips"`
 	MaxOutboundTCPActive       *int64 `json:"max_outbound_tcp_active"`
 	MaxOutboundTCPNewPerSecond *int   `json:"max_outbound_tcp_new_per_second"`
 }
@@ -56,6 +60,7 @@ type Config struct {
 	DefaultCloseWaitTimeoutSeconds *int64                   `json:"default_close_wait_timeout_seconds"`
 	OnlineIPGracePeriodSeconds     int64                    `json:"online_ip_grace_period_seconds"`
 	MaxGlobalTotalConnections      *int64                   `json:"max_global_total_connections"`
+	MaxGlobalInboundConnections    *int64                   `json:"max_global_inbound_connections"`
 	Limits                         []Limit                  `json:"limits"`
 	PortLimits                     []PortLimit              `json:"port_limits"`
 	ManagementMappings             []ManagementGroupMapping `json:"management_mappings"`
@@ -93,15 +98,19 @@ type ConfiguredInbound struct {
 }
 
 type GlobalSnapshot struct {
-	CurrentTotal             int64  `json:"current_total"`
-	MaxTotal                 *int64 `json:"max_total"`
-	RejectedGlobalTotalLimit uint64 `json:"rejected_global_total_limit"`
+	CurrentTotal               int64  `json:"current_total"`
+	MaxTotal                   *int64 `json:"max_total"`
+	CurrentInbound             int64  `json:"current_inbound"`
+	MaxInbound                 *int64 `json:"max_inbound"`
+	RejectedGlobalTotalLimit   uint64 `json:"rejected_global_total_limit"`
+	RejectedGlobalInboundLimit uint64 `json:"rejected_global_inbound_limit"`
 }
 
 type ManagementGroupSnapshot struct {
 	Group                      string         `json:"group"`
 	CurrentTotal               int64          `json:"current_total"`
 	InboundActive              int64          `json:"inbound_active"`
+	InboundCurrent             int64          `json:"inbound_current"`
 	InboundTCP                 TCPStateCounts `json:"inbound_tcp"`
 	InboundOnlineIPs           []OnlineIP     `json:"inbound_online_ips"`
 	OutboundActive             int64          `json:"outbound_active"`
@@ -116,6 +125,13 @@ type ManagementGroupSnapshot struct {
 	RejectedPortNewRateLimit   uint64         `json:"rejected_port_new_rate_limit"`
 	RejectedOnlineIPLimit      uint64         `json:"rejected_online_ip_limit"`
 	RejectedGlobalTotalLimit   uint64         `json:"rejected_global_total_limit"`
+	RejectedUserInboundLimit   uint64         `json:"rejected_user_inbound_limit"`
+	RejectedPortInboundLimit   uint64         `json:"rejected_port_inbound_limit"`
+	RejectedUserOnlineIPLimit  uint64         `json:"rejected_user_online_ip_limit"`
+	RejectedPortOnlineIPLimit  uint64         `json:"rejected_port_online_ip_limit"`
+	RejectedGlobalInboundLimit uint64         `json:"rejected_global_inbound_limit"`
+	MaxInboundConnections      *int64         `json:"max_inbound_connections"`
+	MaxInboundOnlineIPs        *int           `json:"max_inbound_online_ips"`
 	MaxOutboundTCPActive       *int64         `json:"max_outbound_tcp_active"`
 	MaxOutboundTCPNewPerSecond *int           `json:"max_outbound_tcp_new_per_second"`
 }
@@ -127,6 +143,7 @@ type Snapshot struct {
 	OutboundTag                    string         `json:"outbound_tag,omitempty"`
 	Attributed                     bool           `json:"attributed"`
 	InboundActive                  int64          `json:"inbound_active"`
+	InboundCurrent                 int64          `json:"inbound_current"`
 	InboundTotal                   uint64         `json:"inbound_total"`
 	CurrentTotal                   int64          `json:"current_total"`
 	InboundTCP                     TCPStateCounts `json:"inbound_tcp"`
@@ -145,12 +162,19 @@ type Snapshot struct {
 	RejectedPortNewRateLimit       uint64         `json:"rejected_port_new_rate_limit"`
 	RejectedOnlineIPLimit          uint64         `json:"rejected_online_ip_limit"`
 	RejectedGlobalTotalLimit       uint64         `json:"rejected_global_total_limit"`
+	RejectedUserInboundLimit       uint64         `json:"rejected_user_inbound_limit"`
+	RejectedPortInboundLimit       uint64         `json:"rejected_port_inbound_limit"`
+	RejectedUserOnlineIPLimit      uint64         `json:"rejected_user_online_ip_limit"`
+	RejectedPortOnlineIPLimit      uint64         `json:"rejected_port_online_ip_limit"`
+	RejectedGlobalInboundLimit     uint64         `json:"rejected_global_inbound_limit"`
 	MaxInboundOnlineIPs            *int           `json:"max_inbound_online_ips"`
 	MaxTotalConnections            *int64         `json:"max_total_connections"`
 	MaxOutboundTCPActive           *int64         `json:"max_outbound_tcp_active"`
 	MaxOutboundTCPNewPerSecond     *int           `json:"max_outbound_tcp_new_per_second"`
 	MaxPortOutboundTCPActive       *int64         `json:"max_port_outbound_tcp_active"`
 	MaxPortOutboundTCPNewPerSecond *int           `json:"max_port_outbound_tcp_new_per_second"`
+	MaxPortInboundConnections      *int64         `json:"max_port_inbound_connections"`
+	MaxPortInboundOnlineIPs        *int           `json:"max_port_inbound_online_ips"`
 	CloseWaitTimeoutSeconds        *int64         `json:"close_wait_timeout_seconds"`
 	ManagementGroup                string         `json:"management_group,omitempty"`
 }
@@ -158,14 +182,19 @@ type Snapshot struct {
 type LimitReason string
 
 const (
-	ActiveLimit      LimitReason = "port_total_limit"
-	NewRateLimit     LimitReason = "port_new_rate_limit"
-	UserTotalLimit   LimitReason = "user_total_limit"
-	PortTotalLimit   LimitReason = "port_total_limit"
-	UserNewRateLimit LimitReason = "user_new_rate_limit"
-	PortNewRateLimit LimitReason = "port_new_rate_limit"
-	OnlineIPLimit    LimitReason = "online_ip_limit"
-	GlobalTotalLimit LimitReason = "global_total_limit"
+	ActiveLimit        LimitReason = "port_total_limit"
+	NewRateLimit       LimitReason = "port_new_rate_limit"
+	UserTotalLimit     LimitReason = "user_total_limit"
+	PortTotalLimit     LimitReason = "port_total_limit"
+	UserNewRateLimit   LimitReason = "user_new_rate_limit"
+	PortNewRateLimit   LimitReason = "port_new_rate_limit"
+	OnlineIPLimit      LimitReason = "online_ip_limit"
+	GlobalTotalLimit   LimitReason = "global_total_limit"
+	GlobalInboundLimit LimitReason = "global_inbound_limit"
+	UserInboundLimit   LimitReason = "user_inbound_limit"
+	PortInboundLimit   LimitReason = "port_inbound_limit"
+	UserOnlineIPLimit  LimitReason = "user_online_ip_limit"
+	PortOnlineIPLimit  LimitReason = "port_online_ip_limit"
 )
 
 type LimitError struct {
@@ -196,11 +225,21 @@ type managementGroupState struct {
 	outboundNewTotal         uint64
 	rejectedUserTotalLimit   uint64
 	rejectedUserNewRateLimit uint64
+	inboundCurrent           int64
+	sourceActive             map[string]int64
+	sourceSeen               map[string]time.Time
+	rejectedInboundLimit     uint64
+	rejectedOnlineIPLimit    uint64
 }
 
 type portState struct {
-	attemptTimes []time.Time
-	newTimes     []time.Time
+	attemptTimes          []time.Time
+	newTimes              []time.Time
+	inboundCurrent        int64
+	sourceActive          map[string]int64
+	sourceSeen            map[string]time.Time
+	rejectedInboundLimit  uint64
+	rejectedOnlineIPLimit uint64
 }
 
 type socketDirection uint8
@@ -226,24 +265,27 @@ type socketRecord struct {
 }
 
 type Manager struct {
-	mu                 sync.Mutex
-	limits             map[Identity]Limit
-	states             map[Identity]*state
-	inbounds           map[string]ConfiguredInbound
-	defaultCW          *int64
-	onlineIPGrace      time.Duration
-	globalLimit        *int64
-	globalCurrent      int64
-	globalRejected     uint64
-	managementMappings map[Identity]string
-	managementLimits   map[string]ManagementGroupLimit
-	managementStates   map[string]*managementGroupState
-	portLimits         map[string]PortLimit
-	portStates         map[string]*portState
-	sockets            map[uint64]socketRecord
-	nextSocketID       uint64
-	scanSockets        func() (map[socketTuple]string, error)
-	now                func() time.Time
+	mu                    sync.Mutex
+	limits                map[Identity]Limit
+	states                map[Identity]*state
+	inbounds              map[string]ConfiguredInbound
+	defaultCW             *int64
+	onlineIPGrace         time.Duration
+	globalLimit           *int64
+	globalCurrent         int64
+	globalRejected        uint64
+	globalInboundLimit    *int64
+	globalInboundCurrent  int64
+	globalInboundRejected uint64
+	managementMappings    map[Identity]string
+	managementLimits      map[string]ManagementGroupLimit
+	managementStates      map[string]*managementGroupState
+	portLimits            map[string]PortLimit
+	portStates            map[string]*portState
+	sockets               map[uint64]socketRecord
+	nextSocketID          uint64
+	scanSockets           func() (map[socketTuple]string, error)
+	now                   func() time.Time
 }
 
 var Default = NewManager()
@@ -287,6 +329,9 @@ func (m *Manager) Reset() {
 	m.globalLimit = nil
 	m.globalCurrent = 0
 	m.globalRejected = 0
+	m.globalInboundLimit = nil
+	m.globalInboundCurrent = 0
+	m.globalInboundRejected = 0
 	m.managementMappings = make(map[Identity]string)
 	m.managementLimits = make(map[string]ManagementGroupLimit)
 	m.managementStates = make(map[string]*managementGroupState)
@@ -378,22 +423,13 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	if err := validateOptionalPositive("max_global_total_connections", config.MaxGlobalTotalConnections); err != nil {
 		return err
 	}
+	if err := validateOptionalNonNegative("max_global_inbound_connections", config.MaxGlobalInboundConnections); err != nil {
+		return err
+	}
 	replacement := make(map[Identity]Limit, len(config.Limits))
 	for _, limit := range config.Limits {
 		if limit.Identity.InboundTag == "" {
 			return fmt.Errorf("limit identity requires inbound_tag")
-		}
-		if err := validateOptionalPositive("max_outbound_tcp_active", limit.MaxOutboundTCPActive); err != nil {
-			return err
-		}
-		if limit.MaxInboundOnlineIPs != nil && *limit.MaxInboundOnlineIPs <= 0 {
-			return fmt.Errorf("max_inbound_online_ips must be positive when set")
-		}
-		if err := validateOptionalPositive("max_total_connections", limit.MaxTotalConnections); err != nil {
-			return err
-		}
-		if limit.MaxOutboundTCPNewPerSecond != nil && *limit.MaxOutboundTCPNewPerSecond <= 0 {
-			return fmt.Errorf("max_outbound_tcp_new_per_second must be positive when set")
 		}
 		if err := validateOptionalNonNegative("close_wait_timeout_seconds", limit.CloseWaitTimeoutSeconds); err != nil {
 			return err
@@ -417,6 +453,12 @@ func (m *Manager) ReplaceConfig(config Config) error {
 		if limit.Group == "" {
 			return fmt.Errorf("management limit requires group")
 		}
+		if err := validateOptionalNonNegative("management max_inbound_connections", limit.MaxInboundConnections); err != nil {
+			return err
+		}
+		if err := validateOptionalNonNegativeInt("management max_inbound_online_ips", limit.MaxInboundOnlineIPs); err != nil {
+			return err
+		}
 		if err := validateOptionalPositive("management max_outbound_tcp_active", limit.MaxOutboundTCPActive); err != nil {
 			return err
 		}
@@ -433,6 +475,12 @@ func (m *Manager) ReplaceConfig(config Config) error {
 		limit.InboundTag = strings.TrimSpace(limit.InboundTag)
 		if limit.InboundTag == "" {
 			return fmt.Errorf("port limit requires inbound_tag")
+		}
+		if err := validateOptionalNonNegative("port max_inbound_connections", limit.MaxInboundConnections); err != nil {
+			return err
+		}
+		if err := validateOptionalNonNegativeInt("port max_inbound_online_ips", limit.MaxInboundOnlineIPs); err != nil {
+			return err
 		}
 		if err := validateOptionalPositive("port max_outbound_tcp_active", limit.MaxOutboundTCPActive); err != nil {
 			return err
@@ -452,6 +500,7 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	m.portLimits = portLimits
 	m.defaultCW = cloneInt64(config.DefaultCloseWaitTimeoutSeconds)
 	m.globalLimit = cloneInt64(config.MaxGlobalTotalConnections)
+	m.globalInboundLimit = cloneInt64(config.MaxGlobalInboundConnections)
 	m.onlineIPGrace = time.Duration(config.OnlineIPGracePeriodSeconds) * time.Second
 	if m.onlineIPGrace <= 0 {
 		m.onlineIPGrace = 30 * time.Second
@@ -493,6 +542,13 @@ func validateOptionalNonNegative(name string, value *int64) error {
 	return nil
 }
 
+func validateOptionalNonNegativeInt(name string, value *int) error {
+	if value != nil && *value < 0 {
+		return fmt.Errorf("%s must be non-negative", name)
+	}
+	return nil
+}
+
 func validateOptionalPositive(name string, value *int64) error {
 	if value != nil && *value <= 0 {
 		return fmt.Errorf("%s must be positive when set", name)
@@ -526,23 +582,31 @@ func cloneLimit(limit Limit) Limit {
 }
 
 func cloneManagementGroupLimit(limit ManagementGroupLimit) ManagementGroupLimit {
+	limit.MaxInboundConnections = cloneInt64(limit.MaxInboundConnections)
+	limit.MaxInboundOnlineIPs = cloneInt(limit.MaxInboundOnlineIPs)
 	limit.MaxOutboundTCPActive = cloneInt64(limit.MaxOutboundTCPActive)
 	limit.MaxOutboundTCPNewPerSecond = cloneInt(limit.MaxOutboundTCPNewPerSecond)
 	return limit
 }
 
 func clonePortLimit(limit PortLimit) PortLimit {
+	limit.MaxInboundConnections = cloneInt64(limit.MaxInboundConnections)
+	limit.MaxInboundOnlineIPs = cloneInt(limit.MaxInboundOnlineIPs)
 	limit.MaxOutboundTCPActive = cloneInt64(limit.MaxOutboundTCPActive)
 	limit.MaxOutboundTCPNewPerSecond = cloneInt(limit.MaxOutboundTCPNewPerSecond)
 	return limit
 }
 
 func (m *Manager) applyLimitLocked(snapshot *Snapshot, limit Limit) {
-	snapshot.MaxInboundOnlineIPs = cloneInt(limit.MaxInboundOnlineIPs)
-	snapshot.MaxTotalConnections = cloneInt64(limit.MaxTotalConnections)
-	snapshot.MaxOutboundTCPActive = cloneInt64(limit.MaxOutboundTCPActive)
-	snapshot.MaxOutboundTCPNewPerSecond = cloneInt(limit.MaxOutboundTCPNewPerSecond)
+	// Legacy identity-scoped limit fields are intentionally ignored. Identity is
+	// retained for attribution while administrator controls live at group/port.
+	snapshot.MaxInboundOnlineIPs = nil
+	snapshot.MaxTotalConnections = nil
+	snapshot.MaxOutboundTCPActive = nil
+	snapshot.MaxOutboundTCPNewPerSecond = nil
 	portLimit := m.portLimits[snapshot.Identity.InboundTag]
+	snapshot.MaxPortInboundConnections = cloneInt64(portLimit.MaxInboundConnections)
+	snapshot.MaxPortInboundOnlineIPs = cloneInt(portLimit.MaxInboundOnlineIPs)
 	snapshot.MaxPortOutboundTCPActive = cloneInt64(portLimit.MaxOutboundTCPActive)
 	snapshot.MaxPortOutboundTCPNewPerSecond = cloneInt(portLimit.MaxOutboundTCPNewPerSecond)
 	timeout := limit.CloseWaitTimeoutSeconds
@@ -580,8 +644,14 @@ func currentTotal(snapshot Snapshot) int64 {
 func (m *Manager) groupStateLocked(group string) *managementGroupState {
 	item := m.managementStates[group]
 	if item == nil {
-		item = &managementGroupState{}
+		item = &managementGroupState{sourceActive: make(map[string]int64), sourceSeen: make(map[string]time.Time)}
 		m.managementStates[group] = item
+	}
+	if item.sourceActive == nil {
+		item.sourceActive = make(map[string]int64)
+	}
+	if item.sourceSeen == nil {
+		item.sourceSeen = make(map[string]time.Time)
 	}
 	return item
 }
@@ -599,8 +669,14 @@ func (m *Manager) groupOutboundCurrentLocked(group string) int64 {
 func (m *Manager) portStateLocked(tag string) *portState {
 	item := m.portStates[tag]
 	if item == nil {
-		item = &portState{}
+		item = &portState{sourceActive: make(map[string]int64), sourceSeen: make(map[string]time.Time)}
 		m.portStates[tag] = item
+	}
+	if item.sourceActive == nil {
+		item.sourceActive = make(map[string]int64)
+	}
+	if item.sourceSeen == nil {
+		item.sourceSeen = make(map[string]time.Time)
 	}
 	return item
 }
@@ -657,6 +733,23 @@ func (m *Manager) rejectLocked(item *state, identity Identity, group string, rea
 	case GlobalTotalLimit:
 		item.snapshot.RejectedGlobalTotalLimit++
 		m.globalRejected++
+	case GlobalInboundLimit:
+		item.snapshot.RejectedGlobalInboundLimit++
+		m.globalInboundRejected++
+	case UserInboundLimit:
+		item.snapshot.RejectedUserInboundLimit++
+		m.groupStateLocked(group).rejectedInboundLimit++
+	case PortInboundLimit:
+		item.snapshot.RejectedPortInboundLimit++
+		m.portStateLocked(identity.InboundTag).rejectedInboundLimit++
+	case UserOnlineIPLimit:
+		item.snapshot.RejectedUserOnlineIPLimit++
+		item.snapshot.RejectedOnlineIPLimit++
+		m.groupStateLocked(group).rejectedOnlineIPLimit++
+	case PortOnlineIPLimit:
+		item.snapshot.RejectedPortOnlineIPLimit++
+		item.snapshot.RejectedOnlineIPLimit++
+		m.portStateLocked(identity.InboundTag).rejectedOnlineIPLimit++
 	}
 	return &LimitError{Identity: identity, ManagementGroup: group, Reason: reason, Limit: limit}
 }
@@ -694,11 +787,155 @@ func identityFromContext(ctx context.Context) Snapshot {
 	return snapshot
 }
 
+func sourceFromContext(ctx context.Context) string {
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil || !inbound.Source.IsValid() {
+		return ""
+	}
+	address, ok := netip.AddrFromSlice(inbound.Source.Address.IP())
+	if !ok {
+		return ""
+	}
+	return normalizedSourceIP(address)
+}
+
 type lease struct {
 	manager  *Manager
 	identity Identity
 	group    string
 	timeout  time.Duration
+}
+
+type inboundLease struct {
+	manager  *Manager
+	identity Identity
+	group    string
+	port     string
+	source   string
+	once     sync.Once
+}
+
+func positiveInt64(value *int64) bool { return value != nil && *value > 0 }
+func positiveInt(value *int) bool     { return value != nil && *value > 0 }
+
+func pruneSourceSet(active map[string]int64, seen map[string]time.Time, now time.Time, grace time.Duration) {
+	cutoff := now.Add(-grace)
+	for source, lastSeen := range seen {
+		if active[source] <= 0 && !lastSeen.After(cutoff) {
+			delete(active, source)
+			delete(seen, source)
+		}
+	}
+}
+
+func sourceWouldExceed(active map[string]int64, seen map[string]time.Time, source string, limit *int) bool {
+	if source == "" || !positiveInt(limit) || active[source] > 0 {
+		return false
+	}
+	_, retained := seen[source]
+	return !retained && len(seen) >= *limit
+}
+
+func (m *Manager) admitInbound(identity Snapshot, source string) (*inboundLease, error) {
+	now := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	identity = m.effectiveIdentityLocked(identity)
+	key := identity.Identity
+	item := m.stateLocked(key, identity)
+	m.applyLimitLocked(&item.snapshot, m.limits[key])
+	group := m.managementMappings[key]
+	port := key.InboundTag
+	item.snapshot.ManagementGroup = group
+	groupLimit := m.managementLimits[group]
+	portLimit := m.portLimits[port]
+	groupState := m.groupStateLocked(group)
+	portState := m.portStateLocked(port)
+
+	m.pruneSourcesLocked(item, now)
+	pruneSourceSet(groupState.sourceActive, groupState.sourceSeen, now, m.onlineIPGrace)
+	pruneSourceSet(portState.sourceActive, portState.sourceSeen, now, m.onlineIPGrace)
+
+	if positiveInt64(m.globalInboundLimit) && m.globalInboundCurrent >= *m.globalInboundLimit {
+		return nil, m.rejectLocked(item, key, group, GlobalInboundLimit, *m.globalInboundLimit)
+	}
+	if identity.Attributed && group != "" && positiveInt64(groupLimit.MaxInboundConnections) && groupState.inboundCurrent >= *groupLimit.MaxInboundConnections {
+		return nil, m.rejectLocked(item, key, group, UserInboundLimit, *groupLimit.MaxInboundConnections)
+	}
+	if identity.Attributed && port != "" && positiveInt64(portLimit.MaxInboundConnections) && portState.inboundCurrent >= *portLimit.MaxInboundConnections {
+		return nil, m.rejectLocked(item, key, group, PortInboundLimit, *portLimit.MaxInboundConnections)
+	}
+	if identity.Attributed && group != "" && sourceWouldExceed(groupState.sourceActive, groupState.sourceSeen, source, groupLimit.MaxInboundOnlineIPs) {
+		return nil, m.rejectLocked(item, key, group, UserOnlineIPLimit, int64(*groupLimit.MaxInboundOnlineIPs))
+	}
+	if identity.Attributed && port != "" && sourceWouldExceed(portState.sourceActive, portState.sourceSeen, source, portLimit.MaxInboundOnlineIPs) {
+		return nil, m.rejectLocked(item, key, group, PortOnlineIPLimit, int64(*portLimit.MaxInboundOnlineIPs))
+	}
+
+	m.globalInboundCurrent++
+	item.snapshot.InboundCurrent++
+	if group != "" {
+		groupState.inboundCurrent++
+	}
+	if port != "" {
+		portState.inboundCurrent++
+	}
+	if source != "" {
+		item.sourceActive[source]++
+		item.sourceSeen[source] = now
+		if group != "" {
+			groupState.sourceActive[source]++
+			groupState.sourceSeen[source] = now
+		}
+		if port != "" {
+			portState.sourceActive[source]++
+			portState.sourceSeen[source] = now
+		}
+	}
+	return &inboundLease{manager: m, identity: key, group: group, port: port, source: source}, nil
+}
+
+func (l *inboundLease) release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.manager.mu.Lock()
+		now := l.manager.now()
+		if l.manager.globalInboundCurrent > 0 {
+			l.manager.globalInboundCurrent--
+		}
+		if item := l.manager.states[l.identity]; item != nil {
+			if item.snapshot.InboundCurrent > 0 {
+				item.snapshot.InboundCurrent--
+			}
+			if l.source != "" && item.sourceActive[l.source] > 0 {
+				item.sourceActive[l.source]--
+				item.sourceSeen[l.source] = now
+			}
+		}
+		if l.group != "" {
+			state := l.manager.groupStateLocked(l.group)
+			if state.inboundCurrent > 0 {
+				state.inboundCurrent--
+			}
+			if l.source != "" && state.sourceActive[l.source] > 0 {
+				state.sourceActive[l.source]--
+				state.sourceSeen[l.source] = now
+			}
+		}
+		if l.port != "" {
+			state := l.manager.portStateLocked(l.port)
+			if state.inboundCurrent > 0 {
+				state.inboundCurrent--
+			}
+			if l.source != "" && state.sourceActive[l.source] > 0 {
+				state.sourceActive[l.source]--
+				state.sourceSeen[l.source] = now
+			}
+		}
+		l.manager.mu.Unlock()
+	})
 }
 
 func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*lease, error) {
@@ -729,12 +966,6 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	if identity.Attributed && portLimit.MaxOutboundTCPActive != nil && m.portOutboundCurrentLocked(key.InboundTag) >= *portLimit.MaxOutboundTCPActive {
 		return nil, m.rejectLocked(item, key, group, PortTotalLimit, *portLimit.MaxOutboundTCPActive)
 	}
-	if identity.Attributed && limit.MaxTotalConnections != nil && currentTotal(item.snapshot) >= *limit.MaxTotalConnections {
-		return nil, m.rejectLocked(item, key, group, PortTotalLimit, *limit.MaxTotalConnections)
-	}
-	if identity.Attributed && limit.MaxOutboundTCPActive != nil && item.snapshot.OutboundActive+item.snapshot.OutboundPending >= *limit.MaxOutboundTCPActive {
-		return nil, m.rejectLocked(item, key, group, PortTotalLimit, *limit.MaxOutboundTCPActive)
-	}
 	cutoff := now.Add(-time.Second)
 	item.attemptTimes = prune(item.attemptTimes, cutoff)
 	groupState.attemptTimes = prune(groupState.attemptTimes, cutoff)
@@ -744,9 +975,6 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	}
 	if identity.Attributed && portLimit.MaxOutboundTCPNewPerSecond != nil && len(portState.attemptTimes) >= *portLimit.MaxOutboundTCPNewPerSecond {
 		return nil, m.rejectLocked(item, key, group, PortNewRateLimit, int64(*portLimit.MaxOutboundTCPNewPerSecond))
-	}
-	if identity.Attributed && limit.MaxOutboundTCPNewPerSecond != nil && len(item.attemptTimes) >= *limit.MaxOutboundTCPNewPerSecond {
-		return nil, m.rejectLocked(item, key, group, PortNewRateLimit, int64(*limit.MaxOutboundTCPNewPerSecond))
 	}
 	item.attemptTimes = append(item.attemptTimes, now)
 	if group != "" {
@@ -837,36 +1065,20 @@ func (m *Manager) releaseOutbound(identity Identity, socketID uint64) {
 }
 
 func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, error) {
-	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	identity = m.effectiveIdentityLocked(identity)
 	key := identity.Identity
 	item := m.stateLocked(key, identity)
-	limit := m.limits[key]
-	m.applyLimitLocked(&item.snapshot, limit)
+	m.applyLimitLocked(&item.snapshot, m.limits[key])
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
 	if m.globalLimit != nil && m.globalCurrent >= *m.globalLimit {
 		return 0, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
 	}
-	if limit.MaxTotalConnections != nil && currentTotal(item.snapshot) >= *limit.MaxTotalConnections {
-		return 0, m.rejectLocked(item, key, group, PortTotalLimit, *limit.MaxTotalConnections)
-	}
-	source := normalizedSourceIP(tuple.RemoteIP)
-	m.pruneSourcesLocked(item, now)
-	if source != "" && limit.MaxInboundOnlineIPs != nil && item.sourceActive[source] == 0 {
-		if _, retained := item.sourceSeen[source]; !retained && len(item.sourceSeen) >= *limit.MaxInboundOnlineIPs {
-			return 0, m.rejectLocked(item, key, group, OnlineIPLimit, int64(*limit.MaxInboundOnlineIPs))
-		}
-	}
 	item.snapshot.InboundActive++
 	item.snapshot.InboundTotal++
 	m.globalCurrent++
-	if source != "" {
-		item.sourceActive[source]++
-		item.sourceSeen[source] = now
-	}
 	return m.registerSocketLocked(key, inboundSocket, tuple), nil
 }
 
@@ -876,12 +1088,6 @@ func (m *Manager) releaseInbound(identity Identity, socketID uint64, source stri
 		item.snapshot.InboundActive--
 		if m.globalCurrent > 0 {
 			m.globalCurrent--
-		}
-		if source != "" {
-			if item.sourceActive[source] > 0 {
-				item.sourceActive[source]--
-			}
-			item.sourceSeen[source] = m.now()
 		}
 	}
 	m.closeSocketLocked(socketID)
@@ -1034,13 +1240,15 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		})
 		copy := item.snapshot
 		copy.OutboundNewRate = len(item.newTimes)
-		copy.OutboundRejectedTotal = copy.RejectedUserTotalLimit + copy.RejectedPortTotalLimit + copy.RejectedUserNewRateLimit + copy.RejectedPortNewRateLimit + copy.RejectedOnlineIPLimit + copy.RejectedGlobalTotalLimit
+		copy.OutboundRejectedTotal = copy.RejectedUserTotalLimit + copy.RejectedPortTotalLimit + copy.RejectedUserNewRateLimit + copy.RejectedPortNewRateLimit + copy.RejectedGlobalTotalLimit
 		copy.MaxInboundOnlineIPs = cloneInt(copy.MaxInboundOnlineIPs)
 		copy.MaxTotalConnections = cloneInt64(copy.MaxTotalConnections)
 		copy.MaxOutboundTCPActive = cloneInt64(copy.MaxOutboundTCPActive)
 		copy.MaxOutboundTCPNewPerSecond = cloneInt(copy.MaxOutboundTCPNewPerSecond)
 		copy.MaxPortOutboundTCPActive = cloneInt64(copy.MaxPortOutboundTCPActive)
 		copy.MaxPortOutboundTCPNewPerSecond = cloneInt(copy.MaxPortOutboundTCPNewPerSecond)
+		copy.MaxPortInboundConnections = cloneInt64(copy.MaxPortInboundConnections)
+		copy.MaxPortInboundOnlineIPs = cloneInt(copy.MaxPortInboundOnlineIPs)
 		copy.CloseWaitTimeoutSeconds = cloneInt64(copy.CloseWaitTimeoutSeconds)
 		copy.InboundOnlineIPs = append([]OnlineIP(nil), copy.InboundOnlineIPs...)
 		result = append(result, copy)
@@ -1076,7 +1284,14 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 			result[index].OutboundTCP = item.snapshot.OutboundTCP
 		}
 	}
-	global := GlobalSnapshot{CurrentTotal: m.globalCurrent, MaxTotal: cloneInt64(m.globalLimit), RejectedGlobalTotalLimit: m.globalRejected}
+	global := GlobalSnapshot{
+		CurrentTotal:               m.globalCurrent,
+		MaxTotal:                   cloneInt64(m.globalLimit),
+		CurrentInbound:             m.globalInboundCurrent,
+		MaxInbound:                 cloneInt64(m.globalInboundLimit),
+		RejectedGlobalTotalLimit:   m.globalRejected,
+		RejectedGlobalInboundLimit: m.globalInboundRejected,
+	}
 	groupNames := make(map[string]struct{}, len(m.managementLimits)+len(m.managementMappings))
 	for group := range m.managementLimits {
 		groupNames[group] = struct{}{}
@@ -1086,22 +1301,35 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 	}
 	groups := make([]ManagementGroupSnapshot, 0, len(groupNames))
 	groupIndexes := make(map[string]int, len(groupNames))
-	groupIPs := make(map[string]map[string]int64, len(groupNames))
 	for group := range groupNames {
 		limit := m.managementLimits[group]
 		state := m.groupStateLocked(group)
 		state.newTimes = prune(state.newTimes, cutoff)
+		pruneSourceSet(state.sourceActive, state.sourceSeen, now, m.onlineIPGrace)
 		groupIndexes[group] = len(groups)
-		groups = append(groups, ManagementGroupSnapshot{
+		groupSnapshot := ManagementGroupSnapshot{
 			Group:                      group,
+			InboundCurrent:             state.inboundCurrent,
 			OutboundNewRate:            len(state.newTimes),
 			OutboundNewTotal:           state.outboundNewTotal,
 			RejectedUserTotalLimit:     state.rejectedUserTotalLimit,
 			RejectedUserNewRateLimit:   state.rejectedUserNewRateLimit,
+			RejectedUserInboundLimit:   state.rejectedInboundLimit,
+			RejectedUserOnlineIPLimit:  state.rejectedOnlineIPLimit,
+			MaxInboundConnections:      cloneInt64(limit.MaxInboundConnections),
+			MaxInboundOnlineIPs:        cloneInt(limit.MaxInboundOnlineIPs),
 			MaxOutboundTCPActive:       cloneInt64(limit.MaxOutboundTCPActive),
 			MaxOutboundTCPNewPerSecond: cloneInt(limit.MaxOutboundTCPNewPerSecond),
+		}
+		for source, lastSeen := range state.sourceSeen {
+			if state.sourceActive[source] > 0 || lastSeen.After(now.Add(-m.onlineIPGrace)) {
+				groupSnapshot.InboundOnlineIPs = append(groupSnapshot.InboundOnlineIPs, OnlineIP{IP: source, Connections: state.sourceActive[source]})
+			}
+		}
+		sort.Slice(groupSnapshot.InboundOnlineIPs, func(i, j int) bool {
+			return groupSnapshot.InboundOnlineIPs[i].IP < groupSnapshot.InboundOnlineIPs[j].IP
 		})
-		groupIPs[group] = make(map[string]int64)
+		groups = append(groups, groupSnapshot)
 	}
 	for _, user := range result {
 		if user.ManagementGroup == "" {
@@ -1118,22 +1346,16 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		group.OutboundPending += user.OutboundPending
 		group.RejectedPortTotalLimit += user.RejectedPortTotalLimit
 		group.RejectedPortNewRateLimit += user.RejectedPortNewRateLimit
-		group.RejectedOnlineIPLimit += user.RejectedOnlineIPLimit
+		group.RejectedPortInboundLimit += user.RejectedPortInboundLimit
+		group.RejectedPortOnlineIPLimit += user.RejectedPortOnlineIPLimit
 		group.RejectedGlobalTotalLimit += user.RejectedGlobalTotalLimit
+		group.RejectedGlobalInboundLimit += user.RejectedGlobalInboundLimit
 		addTCPCounts(&group.InboundTCP, user.InboundTCP)
 		addTCPCounts(&group.OutboundTCP, user.OutboundTCP)
-		for _, source := range user.InboundOnlineIPs {
-			groupIPs[user.ManagementGroup][source.IP] += source.Connections
-		}
 	}
 	for index := range groups {
-		groups[index].OutboundRejectedTotal = groups[index].RejectedUserTotalLimit + groups[index].RejectedUserNewRateLimit + groups[index].RejectedPortTotalLimit + groups[index].RejectedPortNewRateLimit + groups[index].RejectedOnlineIPLimit + groups[index].RejectedGlobalTotalLimit
-		for ip, connections := range groupIPs[groups[index].Group] {
-			groups[index].InboundOnlineIPs = append(groups[index].InboundOnlineIPs, OnlineIP{IP: ip, Connections: connections})
-		}
-		sort.Slice(groups[index].InboundOnlineIPs, func(i, j int) bool {
-			return groups[index].InboundOnlineIPs[i].IP < groups[index].InboundOnlineIPs[j].IP
-		})
+		groups[index].RejectedOnlineIPLimit = groups[index].RejectedUserOnlineIPLimit + groups[index].RejectedPortOnlineIPLimit
+		groups[index].OutboundRejectedTotal = groups[index].RejectedUserTotalLimit + groups[index].RejectedUserNewRateLimit + groups[index].RejectedPortTotalLimit + groups[index].RejectedPortNewRateLimit + groups[index].RejectedGlobalTotalLimit
 	}
 	m.mu.Unlock()
 	sort.Slice(result, func(i, j int) bool {
@@ -1198,6 +1420,19 @@ func BindInbound(ctx context.Context, conn stdnet.Conn) error {
 		return nil
 	}
 	return tracked.bind(identity)
+}
+
+// AdmitInbound applies Custom-owned logical inbound and online-IP limits after
+// authentication but before routing or outbound selection. Its lease is
+// released when the per-request context ends, so Mux streams are counted as
+// independent logical connections rather than as one physical socket.
+func AdmitInbound(ctx context.Context) error {
+	lease, err := Default.admitInbound(identityFromContext(ctx), sourceFromContext(ctx))
+	if err != nil || lease == nil {
+		return err
+	}
+	context.AfterFunc(ctx, lease.release)
+	return nil
 }
 
 func (c *trackedInboundConn) bind(identity Snapshot) error {

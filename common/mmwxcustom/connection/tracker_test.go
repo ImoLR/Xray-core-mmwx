@@ -27,6 +27,17 @@ func userContext(tag, user string) context.Context {
 	return session.ContextWithOutbounds(ctx, []*session.Outbound{{Tag: "direct"}})
 }
 
+func userContextWithSource(parent context.Context, tag, user, source string) context.Context {
+	ctx := session.ContextWithInbound(parent, &session.Inbound{
+		Tag:     tag,
+		Name:    "shadowsocks",
+		Source:  xnet.TCPDestination(xnet.ParseAddress(source), 45000),
+		Gateway: xnet.TCPDestination(xnet.AnyIP, 12968),
+		User:    &protocol.MemoryUser{Email: user},
+	})
+	return session.ContextWithOutbounds(ctx, []*session.Outbound{{Tag: "direct"}})
+}
+
 func findSnapshot(t *testing.T, manager *Manager, identity Identity) Snapshot {
 	t.Helper()
 	for _, snapshot := range manager.Snapshots() {
@@ -41,7 +52,7 @@ func findSnapshot(t *testing.T, manager *Manager, identity Identity) Snapshot {
 func TestActiveLimitConcurrentAndCloseExactlyOnce(t *testing.T) {
 	manager := NewManager()
 	identity := Identity{InboundTag: "in-a", User: "user-a"}
-	if err := manager.ReplaceConfig(Config{Limits: []Limit{{Identity: identity, MaxOutboundTCPActive: pointer[int64](4)}}}); err != nil {
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: identity.InboundTag, MaxOutboundTCPActive: pointer[int64](4)}}}); err != nil {
 		t.Fatal(err)
 	}
 	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
@@ -92,7 +103,7 @@ func TestDialFailureRollbackAndRateWindow(t *testing.T) {
 	identity := Identity{InboundTag: "in-a", User: "user-a"}
 	now := time.Unix(100, 0)
 	manager.now = func() time.Time { return now }
-	if err := manager.ReplaceConfig(Config{Limits: []Limit{{Identity: identity, MaxOutboundTCPNewPerSecond: pointer(2)}}}); err != nil {
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: identity.InboundTag, MaxOutboundTCPNewPerSecond: pointer(2)}}}); err != nil {
 		t.Fatal(err)
 	}
 	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
@@ -126,7 +137,7 @@ func TestDialFailureRollbackAndRateWindow(t *testing.T) {
 func TestUDPBypassUnattributedAndUserIsolation(t *testing.T) {
 	manager := NewManager()
 	identityA := Identity{InboundTag: "in-a", User: "user-a"}
-	if err := manager.ReplaceConfig(Config{Limits: []Limit{{Identity: identityA, MaxOutboundTCPActive: pointer[int64](1)}}}); err != nil {
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: identityA.InboundTag, MaxOutboundTCPActive: pointer[int64](1)}}}); err != nil {
 		t.Fatal(err)
 	}
 	if lease, err := manager.acquire(userContext("in-a", "user-a"), xnet.UDPDestination(xnet.DomainAddress("example.com"), 53)); err != nil || lease != nil {
@@ -244,6 +255,10 @@ func TestExactTupleAttributesInboundAndOutboundTimeWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	kernel[inboundTuple] = tcpEstablishedState
+	inboundLease, err := manager.admitInbound(identityFromContext(userContext("in-a", "user-a")), normalizedSourceIP(inboundTuple.RemoteIP))
+	if err != nil {
+		t.Fatal(err)
+	}
 	wrongTuple := inboundTuple
 	wrongTuple.RemotePort++
 	kernel[wrongTuple] = tcpCloseWaitState
@@ -263,6 +278,7 @@ func TestExactTupleAttributesInboundAndOutboundTimeWait(t *testing.T) {
 	}
 
 	manager.releaseInbound(identity, inboundID, normalizedSourceIP(inboundTuple.RemoteIP))
+	inboundLease.release()
 	if err := outbound.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +310,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	userA := Identity{InboundTag: "in-a", User: "user-a"}
 	if err := manager.ReplaceConfig(Config{
 		MaxGlobalTotalConnections: pointer[int64](3),
-		Limits:                    []Limit{{Identity: userA, MaxTotalConnections: pointer[int64](2)}},
+		PortLimits:                []PortLimit{{InboundTag: userA.InboundTag, MaxOutboundTCPActive: pointer[int64](1)}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -332,58 +348,269 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	}
 }
 
-func TestOnlineIPLimitUsesAuthenticatedSourceAndGrace(t *testing.T) {
-	manager := NewManager()
-	now := time.Unix(100, 0)
-	manager.now = func() time.Time { return now }
-	identity := Identity{InboundTag: "in-a", User: "user-a"}
-	if err := manager.ReplaceConfig(Config{OnlineIPGracePeriodSeconds: 30, Limits: []Limit{{Identity: identity, MaxInboundOnlineIPs: pointer(1)}}}); err != nil {
-		t.Fatal(err)
-	}
-	first := socketTuple{LocalIP: stdnetIPToAddr("10.0.0.1"), LocalPort: 10022, RemoteIP: stdnetIPToAddr("198.51.100.1"), RemotePort: 45000}
-	firstID, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second := first
-	second.RemoteIP = stdnetIPToAddr("198.51.100.2")
-	second.RemotePort++
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), second); err == nil {
-		t.Fatal("online IP limit did not reject a second source")
-	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != OnlineIPLimit {
-		t.Fatalf("unexpected online IP error: %v", err)
-	}
-	manager.releaseInbound(identity, firstID, normalizedSourceIP(first.RemoteIP))
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), second); err == nil {
-		t.Fatal("online IP grace was not retained")
-	}
-	now = now.Add(31 * time.Second)
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), second); err != nil {
-		t.Fatalf("expired online IP grace still rejected: %v", err)
+func requireLimitReason(t *testing.T, err error, reason LimitReason) {
+	t.Helper()
+	var limitErr *LimitError
+	if !errors.As(err, &limitErr) || limitErr.Reason != reason {
+		t.Fatalf("limit error = %v, want %s", err, reason)
 	}
 }
 
-func TestRejectedInboundIsCountedOnceAcrossRepeatedDispatch(t *testing.T) {
+func TestInboundGlobalUserPortPrecedenceAndCrossPortAggregation(t *testing.T) {
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	for _, test := range []struct {
+		name               string
+		global, user, port int64
+		second             Identity
+		want               LimitReason
+	}{
+		{name: "global", global: 1, user: 3, port: 3, second: identityA, want: GlobalInboundLimit},
+		{name: "user across ports", global: 3, user: 1, port: 3, second: identityB, want: UserInboundLimit},
+		{name: "port", global: 3, user: 3, port: 1, second: identityA, want: PortInboundLimit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager()
+			if err := manager.ReplaceConfig(Config{
+				MaxGlobalInboundConnections: &test.global,
+				ManagementMappings:          []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+				ManagementLimits:            []ManagementGroupLimit{{Group: "ken", MaxInboundConnections: &test.user}},
+				PortLimits:                  []PortLimit{{InboundTag: "in-a", MaxInboundConnections: &test.port}, {InboundTag: "in-b", MaxInboundConnections: &test.port}},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first, err := manager.admitInbound(identityFromContext(userContext(identityA.InboundTag, identityA.User)), "198.51.100.1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.release()
+			if _, err := manager.admitInbound(identityFromContext(userContext(test.second.InboundTag, test.second.User)), "198.51.100.1"); err == nil {
+				t.Fatal("second logical inbound exceeded a configured ceiling")
+			} else {
+				requireLimitReason(t, err, test.want)
+			}
+		})
+	}
+}
+
+func TestInboundConcurrentAdmissionDoesNotExceedLimit(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	limit := int64(4)
+	if err := manager.ReplaceConfig(Config{MaxGlobalInboundConnections: &limit}); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var leases []*inboundLease
+	var wait sync.WaitGroup
+	for index := 0; index < 40; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			lease, err := manager.admitInbound(identityFromContext(userContext(identity.InboundTag, identity.User)), "198.51.100.1")
+			if err == nil {
+				mu.Lock()
+				leases = append(leases, lease)
+				mu.Unlock()
+			}
+		}()
+	}
+	wait.Wait()
+	if len(leases) != int(limit) {
+		t.Fatalf("accepted %d logical inbounds, want %d", len(leases), limit)
+	}
+	for _, lease := range leases {
+		lease.release()
+	}
+}
+
+func TestInboundContextFailureReleasesReservation(t *testing.T) {
 	manager := NewManager()
 	previous := Default
 	Default = manager
 	t.Cleanup(func() { Default = previous })
-	identity := Identity{InboundTag: "in-a", User: "user-a"}
-	if err := manager.ReplaceConfig(Config{Limits: []Limit{{Identity: identity, MaxTotalConnections: pointer[int64](1)}}}); err != nil {
+	limit := int64(1)
+	if err := manager.ReplaceConfig(Config{MaxGlobalInboundConnections: &limit}); err != nil {
 		t.Fatal(err)
 	}
-	first := newAddressedConn("10.0.0.1", 10022, "198.51.100.1", 45000)
-	if err := BindInbound(userContext("in-a", "user-a"), TrackInbound(first)); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx = userContextWithSource(ctx, "in-a", "proto-a", "198.51.100.1")
+	if err := AdmitInbound(ctx); err != nil {
 		t.Fatal(err)
 	}
-	second := TrackInbound(newAddressedConn("10.0.0.1", 10022, "198.51.100.2", 45001))
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := BindInbound(userContext("in-a", "user-a"), second); err == nil {
-			t.Fatal("expected repeated dispatch to retain the rejection")
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), "198.51.100.1"); err == nil {
+		t.Fatal("reservation was not held while processing")
+	}
+	cancel()
+	deadline := time.Now().Add(time.Second)
+	for {
+		lease, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), "198.51.100.1")
+		if err == nil {
+			lease.release()
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("canceled processing did not release inbound reservation")
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if got := findSnapshot(t, manager, identity); got.RejectedPortTotalLimit != 1 {
-		t.Fatalf("one inbound socket produced repeated rejection counters: %#v", got)
+}
+
+func TestUserAndPortOnlineIPLimitsDeduplicateAcrossPorts(t *testing.T) {
+	manager := NewManager()
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	userLimit, portLimit := 3, 2
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxInboundOnlineIPs: &userLimit}},
+		PortLimits:         []PortLimit{{InboundTag: "in-a", MaxInboundOnlineIPs: &portLimit}, {InboundTag: "in-b", MaxInboundOnlineIPs: &portLimit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var leases []*inboundLease
+	for _, item := range []struct {
+		identity Identity
+		source   string
+	}{
+		{identityA, "198.51.100.1"}, {identityA, "198.51.100.2"},
+		{identityB, "198.51.100.2"}, {identityB, "198.51.100.3"},
+	} {
+		lease, err := manager.admitInbound(identityFromContext(userContext(item.identity.InboundTag, item.identity.User)), item.source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leases = append(leases, lease)
+	}
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-b", "proto-b")), "198.51.100.4"); err == nil {
+		t.Fatal("fourth user-level unique IP was admitted")
+	} else {
+		requireLimitReason(t, err, UserOnlineIPLimit)
+	}
+	_, _, groups, err := manager.FullSnapshotReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(groups) != 1 || groups[0].InboundCurrent != 4 || len(groups[0].InboundOnlineIPs) != 3 {
+		t.Fatalf("deduplicated management snapshot = %#v", groups)
+	}
+	for _, lease := range leases {
+		lease.release()
+	}
+}
+
+func TestPortOnlineIPLimitIsIndependent(t *testing.T) {
+	manager := NewManager()
+	portLimit := 1
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: "in-a", MaxInboundOnlineIPs: &portLimit}, {InboundTag: "in-b", MaxInboundOnlineIPs: &portLimit}}}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.2"); err == nil {
+		t.Fatal("second port-level IP was admitted")
+	} else {
+		requireLimitReason(t, err, PortOnlineIPLimit)
+	}
+	second, err := manager.admitInbound(identityFromContext(userContext("in-b", "b")), "198.51.100.2")
+	if err != nil {
+		t.Fatalf("independent port rejected its first IP: %v", err)
+	}
+	second.release()
+}
+
+func TestUserOnlineIPGraceStartsAfterLastCrossPortConnection(t *testing.T) {
+	manager := NewManager()
+	now := time.Unix(100, 0)
+	manager.now = func() time.Time { return now }
+	identityA := Identity{InboundTag: "in-a", User: "a"}
+	identityB := Identity{InboundTag: "in-b", User: "b"}
+	limit := 1
+	if err := manager.ReplaceConfig(Config{
+		OnlineIPGracePeriodSeconds: 30,
+		ManagementMappings:         []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
+		ManagementLimits:           []ManagementGroupLimit{{Group: "ken", MaxInboundOnlineIPs: &limit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.1")
+	second, _ := manager.admitInbound(identityFromContext(userContext("in-b", "b")), "198.51.100.1")
+	first.release()
+	now = now.Add(20 * time.Second)
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.2"); err == nil {
+		t.Fatal("user IP was released while still active on another port")
+	}
+	second.release()
+	now = now.Add(29 * time.Second)
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.2"); err == nil {
+		t.Fatal("user IP grace expired too early")
+	}
+	now = now.Add(2 * time.Second)
+	lease, err := manager.admitInbound(identityFromContext(userContext("in-a", "a")), "198.51.100.2")
+	if err != nil {
+		t.Fatalf("expired user IP grace still rejected: %v", err)
+	}
+	lease.release()
+}
+
+func TestOnlineIPIPv6UsesSlash64AndIdentityMapping(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	limit := 1
+	if err := manager.ReplaceConfig(Config{
+		ManagementMappings: []ManagementGroupMapping{{Identity: identity, Group: "ken"}},
+		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxInboundOnlineIPs: &limit}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), normalizedSourceIP(netip.MustParseAddr("2001:db8:1::1")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.release()
+	second, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), normalizedSourceIP(netip.MustParseAddr("2001:db8:1::99")))
+	if err != nil {
+		t.Fatalf("same IPv6 /64 was counted twice: %v", err)
+	}
+	defer second.release()
+	if _, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), normalizedSourceIP(netip.MustParseAddr("2001:db8:2::1"))); err == nil {
+		t.Fatal("different IPv6 /64 was admitted")
+	} else {
+		requireLimitReason(t, err, UserOnlineIPLimit)
+	}
+	if got := findSnapshot(t, manager, identity); got.ManagementGroup != "ken" || len(got.InboundOnlineIPs) != 1 {
+		t.Fatalf("identity mapping or IPv6 tracking failed: %#v", got)
+	}
+}
+
+func TestLegacyIdentityLimitsAreIgnoredWithoutBreakingCloseWait(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	zero := int64(0)
+	zeroIPs := 0
+	closeWait := int64(5)
+	if err := manager.ReplaceConfig(Config{Limits: []Limit{{
+		Identity: identity, MaxInboundOnlineIPs: &zeroIPs, MaxTotalConnections: &zero,
+		MaxOutboundTCPActive: &zero, MaxOutboundTCPNewPerSecond: &zeroIPs, CloseWaitTimeoutSeconds: &closeWait,
+	}}}); err != nil {
+		t.Fatalf("historic identity limit config was rejected: %v", err)
+	}
+	first, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), "198.51.100.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.admitInbound(identityFromContext(userContext("in-a", "proto-a")), "198.51.100.2")
+	if err != nil {
+		t.Fatalf("historic identity limit was still enforced: %v", err)
+	}
+	first.release()
+	second.release()
+	got := findSnapshot(t, manager, identity)
+	if got.MaxInboundOnlineIPs != nil || got.MaxTotalConnections != nil || got.MaxOutboundTCPActive != nil || got.CloseWaitTimeoutSeconds == nil || *got.CloseWaitTimeoutSeconds != 5 {
+		t.Fatalf("legacy identity compatibility snapshot = %#v", got)
 	}
 }
 
@@ -483,7 +710,7 @@ func TestManagementAndPortLimitsHaveDistinctReasons(t *testing.T) {
 	if err := manager.ReplaceConfig(Config{
 		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
 		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &userLimit}},
-		Limits:             []Limit{{Identity: identityB, MaxOutboundTCPActive: &portLimit}},
+		PortLimits:         []PortLimit{{InboundTag: identityB.InboundTag, MaxOutboundTCPActive: &portLimit}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -502,7 +729,7 @@ func TestManagementAndPortLimitsHaveDistinctReasons(t *testing.T) {
 	if err := manager.ReplaceConfig(Config{
 		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
 		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPActive: &userLimit}},
-		Limits:             []Limit{{Identity: identityB, MaxOutboundTCPActive: &portLimit}},
+		PortLimits:         []PortLimit{{InboundTag: identityB.InboundTag, MaxOutboundTCPActive: &portLimit}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -554,7 +781,7 @@ func TestManagementAndPortNewRateLimitsAreCrossPortAndDistinct(t *testing.T) {
 	if err := manager.ReplaceConfig(Config{
 		ManagementMappings: []ManagementGroupMapping{{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"}},
 		ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxOutboundTCPNewPerSecond: &userRate}},
-		Limits:             []Limit{{Identity: identityA, MaxOutboundTCPNewPerSecond: &portRate}},
+		PortLimits:         []PortLimit{{InboundTag: identityA.InboundTag, MaxOutboundTCPNewPerSecond: &portRate}},
 	}); err != nil {
 		t.Fatal(err)
 	}

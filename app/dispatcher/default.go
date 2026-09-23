@@ -287,6 +287,9 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 		if err := customconnection.BindInbound(ctx, inbound.Conn); err != nil {
 			return nil, errors.New("inbound connection rejected by custom connection control").Base(err)
 		}
+		if err := customconnection.AdmitInbound(ctx); err != nil {
+			return nil, errors.New("inbound connection rejected by custom inbound admission").Base(err)
+		}
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
@@ -348,6 +351,9 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if inbound := session.InboundFromContext(ctx); inbound != nil {
 		if err := customconnection.BindInbound(ctx, inbound.Conn); err != nil {
 			return errors.New("inbound connection rejected by custom connection control").Base(err)
+		}
+		if err := customconnection.AdmitInbound(ctx); err != nil {
+			return errors.New("inbound connection rejected by custom inbound admission").Base(err)
 		}
 	}
 	outbounds := session.OutboundsFromContext(ctx)

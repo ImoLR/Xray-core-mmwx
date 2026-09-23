@@ -44,7 +44,7 @@ func TestControlServerSnapshotAndConfig(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
 	response = httptest.NewRecorder()
 	server.Handler.ServeHTTP(response, request)
-	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":3`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":4`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
 		t.Fatalf("v3 snapshot/global fields missing: %s", response.Body.String())
 	}
 }

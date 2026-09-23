@@ -94,7 +94,7 @@ func newControlServer(manager *Manager) *http.Server {
 			writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		writeControlJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": 3})
+		writeControlJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": 4})
 	})
 	mux.HandleFunc("/v1/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -106,7 +106,7 @@ func newControlServer(manager *Manager) *http.Server {
 			writeControlJSON(w, http.StatusServiceUnavailable, map[string]any{"error": err.Error()})
 			return
 		}
-		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 3, StartedAt: startedAt, Global: global, Inbounds: manager.ConfiguredInbounds(), Users: users, ManagementGroups: groups})
+		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 4, StartedAt: startedAt, Global: global, Inbounds: manager.ConfiguredInbounds(), Users: users, ManagementGroups: groups})
 	})
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
