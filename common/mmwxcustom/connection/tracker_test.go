@@ -745,6 +745,52 @@ func TestManagementAndPortLimitsHaveDistinctReasons(t *testing.T) {
 	second.failed()
 }
 
+func TestManagementAndPortCombinedLimitsIncludeInboundAndOutbound(t *testing.T) {
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	destination := xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)
+	for _, test := range []struct {
+		name   string
+		config Config
+		want   LimitReason
+	}{
+		{
+			name: "management combined",
+			config: Config{
+				ManagementMappings: []ManagementGroupMapping{{Identity: identity, Group: "ken"}},
+				ManagementLimits:   []ManagementGroupLimit{{Group: "ken", MaxTotalConnections: pointer[int64](2)}},
+			},
+			want: UserCombinedLimit,
+		},
+		{
+			name:   "port combined",
+			config: Config{PortLimits: []PortLimit{{InboundTag: identity.InboundTag, MaxTotalConnections: pointer[int64](2)}}},
+			want:   PortCombinedLimit,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager()
+			if err := manager.ReplaceConfig(test.config); err != nil {
+				t.Fatal(err)
+			}
+			socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, socketTuple{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first, err := manager.acquire(userContext(identity.InboundTag, identity.User), destination)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.acquire(userContext(identity.InboundTag, identity.User), destination); err == nil {
+				t.Fatal("combined total limit accepted a third resource")
+			} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != test.want {
+				t.Fatalf("combined rejection = %v, want %s", err, test.want)
+			}
+			first.failed()
+			manager.releaseInbound(identity, socketID, "")
+		})
+	}
+}
+
 func TestPortAggregateLimitCannotBeBypassedByChangingProtocolIdentity(t *testing.T) {
 	manager := NewManager()
 	limit := int64(3)

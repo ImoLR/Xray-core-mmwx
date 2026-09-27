@@ -23,7 +23,7 @@ func TestControlServerSnapshotAndConfig(t *testing.T) {
 		t.Fatalf("snapshot status = %d", response.Code)
 	}
 
-	body := []byte(`{"online_ip_grace_period_seconds":45,"max_global_total_connections":30,"limits":[{"identity":{"inbound_tag":"in-a","user":"user-a"},"max_inbound_online_ips":2,"max_total_connections":9,"max_outbound_tcp_active":3}],"port_limits":[{"inbound_tag":"in-a","max_outbound_tcp_active":7}],"management_mappings":[{"identity":{"inbound_tag":"in-a","user":"user-a"},"group":"ken"}],"management_limits":[{"group":"ken","max_outbound_tcp_active":11}]}`)
+	body := []byte(`{"online_ip_grace_period_seconds":45,"max_global_total_connections":30,"limits":[{"identity":{"inbound_tag":"in-a","user":"user-a"},"max_inbound_online_ips":2,"max_total_connections":9,"max_outbound_tcp_active":3}],"port_limits":[{"inbound_tag":"in-a","max_total_connections":13,"max_outbound_tcp_active":7}],"management_mappings":[{"identity":{"inbound_tag":"in-a","user":"user-a"},"group":"ken"}],"management_limits":[{"group":"ken","max_total_connections":17,"max_outbound_tcp_active":11}]}`)
 	request = httptest.NewRequest(http.MethodPut, "/v1/config", bytes.NewReader(body))
 	response = httptest.NewRecorder()
 	server.Handler.ServeHTTP(response, request)
@@ -38,14 +38,14 @@ func TestControlServerSnapshotAndConfig(t *testing.T) {
 	globalLimit := manager.globalLimit
 	grace := manager.onlineIPGrace
 	manager.mu.Unlock()
-	if limit.MaxOutboundTCPActive == nil || *limit.MaxOutboundTCPActive != 3 || limit.MaxTotalConnections == nil || *limit.MaxTotalConnections != 9 || limit.MaxInboundOnlineIPs == nil || *limit.MaxInboundOnlineIPs != 2 || portLimit.MaxOutboundTCPActive == nil || *portLimit.MaxOutboundTCPActive != 7 || managementLimit.MaxOutboundTCPActive == nil || *managementLimit.MaxOutboundTCPActive != 11 || managementGroup != "ken" || globalLimit == nil || *globalLimit != 30 || grace.Seconds() != 45 {
+	if limit.MaxOutboundTCPActive == nil || *limit.MaxOutboundTCPActive != 3 || limit.MaxTotalConnections == nil || *limit.MaxTotalConnections != 9 || limit.MaxInboundOnlineIPs == nil || *limit.MaxInboundOnlineIPs != 2 || portLimit.MaxTotalConnections == nil || *portLimit.MaxTotalConnections != 13 || portLimit.MaxOutboundTCPActive == nil || *portLimit.MaxOutboundTCPActive != 7 || managementLimit.MaxTotalConnections == nil || *managementLimit.MaxTotalConnections != 17 || managementLimit.MaxOutboundTCPActive == nil || *managementLimit.MaxOutboundTCPActive != 11 || managementGroup != "ken" || globalLimit == nil || *globalLimit != 30 || grace.Seconds() != 45 {
 		t.Fatalf("config was not applied: %#v", limit)
 	}
 	request = httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
 	response = httptest.NewRecorder()
 	server.Handler.ServeHTTP(response, request)
-	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":4`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
-		t.Fatalf("v3 snapshot/global fields missing: %s", response.Body.String())
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":5`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
+		t.Fatalf("v5 snapshot/global fields missing: %s", response.Body.String())
 	}
 }
 
