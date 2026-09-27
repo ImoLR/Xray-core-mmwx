@@ -269,12 +269,20 @@ type socketTuple struct {
 }
 
 type socketRecord struct {
-	ID        uint64
-	Identity  Identity
-	Direction socketDirection
-	Tuple     socketTuple
-	ClosedAt  time.Time
+	ID           uint64
+	Identity     Identity
+	Direction    socketDirection
+	Tuple        socketTuple
+	ClosedAt     time.Time
+	LastState    string
+	LastSeenAt   time.Time
+	MissingSince time.Time
 }
+
+// Closed sockets keep their exact tuple ownership long enough to cover the
+// normal Linux TIME_WAIT window. The record itself is not a connection count:
+// it contributes to Total only while the exact tuple exists in /proc/net/tcp*.
+const socketTombstoneRetention = 2 * time.Minute
 
 type Manager struct {
 	mu                    sync.Mutex
@@ -659,7 +667,7 @@ func (m *Manager) stateLocked(identity Identity, metadata Snapshot) *state {
 }
 
 func currentTotal(snapshot Snapshot) int64 {
-	return snapshot.InboundActive + snapshot.OutboundActive + snapshot.OutboundPending
+	return snapshot.InboundTCP.Total + snapshot.OutboundTCP.Total
 }
 
 func (m *Manager) groupStateLocked(group string) *managementGroupState {
@@ -688,13 +696,11 @@ func (m *Manager) groupOutboundCurrentLocked(group string) int64 {
 }
 
 func (m *Manager) groupCurrentLocked(group string) int64 {
-	var total int64
-	for identity, item := range m.states {
-		if m.managementMappings[identity] == group {
-			total += currentTotal(item.snapshot)
-		}
-	}
-	return total
+	return m.socketOccupancyLocked(func(record socketRecord) bool {
+		return m.managementMappings[record.Identity] == group
+	}) + m.pendingOutboundLocked(func(identity Identity) bool {
+		return m.managementMappings[identity] == group
+	})
 }
 
 func (m *Manager) portStateLocked(tag string) *portState {
@@ -723,13 +729,46 @@ func (m *Manager) portOutboundCurrentLocked(tag string) int64 {
 }
 
 func (m *Manager) portCurrentLocked(tag string) int64 {
+	return m.socketOccupancyLocked(func(record socketRecord) bool {
+		return record.Identity.InboundTag == tag
+	}) + m.pendingOutboundLocked(func(identity Identity) bool {
+		return identity.InboundTag == tag
+	})
+}
+
+// socketOccupancyLocked is the race-safe admission view. A socket already
+// observed in the kernel counts by its exact tuple/state. A newly registered
+// live socket that has not reached the next kernel scan counts as an internal
+// reservation. Closed tombstones that are absent from the kernel never count.
+// Duplicate records for a reused tuple are reduced to one owner.
+func (m *Manager) socketOccupancyLocked(include func(socketRecord) bool) int64 {
+	owned := make(map[socketTuple]socketRecord)
+	for _, record := range m.sockets {
+		if include != nil && !include(record) {
+			continue
+		}
+		if record.LastState == "" && !record.ClosedAt.IsZero() && !record.MissingSince.IsZero() {
+			continue
+		}
+		if current, exists := owned[record.Tuple]; !exists || preferSocketRecord(record, current) {
+			owned[record.Tuple] = record
+		}
+	}
+	return int64(len(owned))
+}
+
+func (m *Manager) pendingOutboundLocked(include func(Identity) bool) int64 {
 	var total int64
 	for identity, item := range m.states {
-		if identity.InboundTag == tag {
-			total += currentTotal(item.snapshot)
+		if include == nil || include(identity) {
+			total += item.snapshot.OutboundPending
 		}
 	}
 	return total
+}
+
+func (m *Manager) coreCurrentLocked() int64 {
+	return m.socketOccupancyLocked(nil) + m.pendingOutboundLocked(nil)
 }
 
 func (m *Manager) effectiveIdentityLocked(snapshot Snapshot) Snapshot {
@@ -1000,7 +1039,7 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	m.applyLimitLocked(&item.snapshot, limit)
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
-	if m.globalLimit != nil && m.globalCurrent >= *m.globalLimit {
+	if m.globalLimit != nil && m.coreCurrentLocked() >= *m.globalLimit {
 		return nil, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
 	}
 	groupLimit := m.managementLimits[group]
@@ -1102,7 +1141,11 @@ func (l *lease) succeeded(conn stdnet.Conn) stdnet.Conn {
 		}
 	}
 	l.manager.mu.Unlock()
-	return &trackedOutboundConn{Conn: conn, release: func() { l.manager.releaseOutbound(l.identity, socketID) }, closeWaitTimeout: l.timeout}
+	return &trackedOutboundConn{
+		Conn: conn, manager: l.manager, socketID: socketID,
+		release:          func() { l.manager.releaseOutbound(l.identity, socketID) },
+		closeWaitTimeout: l.timeout,
+	}
 }
 
 func (m *Manager) releaseOutbound(identity Identity, socketID uint64) {
@@ -1126,7 +1169,7 @@ func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, err
 	m.applyLimitLocked(&item.snapshot, m.limits[key])
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
-	if m.globalLimit != nil && m.globalCurrent >= *m.globalLimit {
+	if m.globalLimit != nil && m.coreCurrentLocked() >= *m.globalLimit {
 		return 0, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
 	}
 	groupLimit := m.managementLimits[group]
@@ -1290,7 +1333,7 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		item.snapshot.InboundTCP = TCPStateCounts{}
 		item.snapshot.OutboundTCP = TCPStateCounts{}
 		item.snapshot.InboundOnlineIPs = nil
-		item.snapshot.CurrentTotal = currentTotal(item.snapshot)
+		item.snapshot.CurrentTotal = 0
 		for source, seen := range item.sourceSeen {
 			if item.sourceActive[source] > 0 || seen.After(now.Add(-m.onlineIPGrace)) {
 				item.snapshot.InboundOnlineIPs = append(item.snapshot.InboundOnlineIPs, OnlineIP{IP: source, Connections: item.sourceActive[source]})
@@ -1319,23 +1362,51 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		result = append(result, copy)
 		m.states[identity] = item
 	}
+	// One kernel row represents one exact four-tuple. A tuple can have an old
+	// tombstone and a newer live record during reuse, so select one owner before
+	// aggregation. This keeps Core/User/Port totals additive without counting a
+	// physical socket twice.
+	ownedKernelSockets := make(map[socketTuple]socketRecord)
+	for _, record := range m.sockets {
+		if _, found := kernelSockets[record.Tuple]; !found {
+			continue
+		}
+		if current, exists := ownedKernelSockets[record.Tuple]; !exists || preferSocketRecord(record, current) {
+			ownedKernelSockets[record.Tuple] = record
+		}
+	}
 	for socketID, record := range m.sockets {
-		stateCode, found := kernelSockets[record.Tuple]
-		if !found {
-			if !record.ClosedAt.IsZero() && now.Sub(record.ClosedAt) >= 10*time.Second {
-				delete(m.sockets, socketID)
+		owner, owned := ownedKernelSockets[record.Tuple]
+		if owned && owner.ID == record.ID {
+			stateCode := kernelSockets[record.Tuple]
+			record.LastState = stateCode
+			record.LastSeenAt = now
+			record.MissingSince = time.Time{}
+			m.sockets[socketID] = record
+			if item := m.states[record.Identity]; item != nil {
+				if record.Direction == inboundSocket {
+					addTCPState(&item.snapshot.InboundTCP, stateCode)
+				} else {
+					addTCPState(&item.snapshot.OutboundTCP, stateCode)
+				}
 			}
 			continue
 		}
-		item := m.states[record.Identity]
-		if item == nil {
-			continue
+
+		// An absent tuple, or a superseded record for a reused tuple, is not a
+		// TCP state and therefore never contributes to Total. Closed records are
+		// retained only as bounded attribution tombstones.
+		record.LastState = ""
+		if !record.ClosedAt.IsZero() {
+			if record.MissingSince.IsZero() {
+				record.MissingSince = now
+			}
+			if now.Sub(record.MissingSince) >= socketTombstoneRetention {
+				delete(m.sockets, socketID)
+				continue
+			}
 		}
-		if record.Direction == inboundSocket {
-			addTCPState(&item.snapshot.InboundTCP, stateCode)
-		} else {
-			addTCPState(&item.snapshot.OutboundTCP, stateCode)
-		}
+		m.sockets[socketID] = record
 	}
 	// Socket-state aggregation updates the live snapshots after the first copy.
 	// Refresh those two fields without disturbing the rate snapshot taken above.
@@ -1344,13 +1415,15 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		byIdentity[result[index].Identity] = index
 	}
 	for identity, item := range m.states {
+		item.snapshot.CurrentTotal = currentTotal(item.snapshot)
 		if index, ok := byIdentity[identity]; ok {
 			result[index].InboundTCP = item.snapshot.InboundTCP
 			result[index].OutboundTCP = item.snapshot.OutboundTCP
+			result[index].CurrentTotal = item.snapshot.CurrentTotal
 		}
 	}
 	global := GlobalSnapshot{
-		CurrentTotal:               m.globalCurrent,
+		CurrentTotal:               int64(len(ownedKernelSockets)),
 		MaxTotal:                   cloneInt64(m.globalLimit),
 		CurrentInbound:             m.globalInboundCurrent,
 		MaxInbound:                 cloneInt64(m.globalInboundLimit),
@@ -1435,6 +1508,18 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 	})
 	sort.Slice(groups, func(i, j int) bool { return groups[i].Group < groups[j].Group })
 	return result, global, groups, nil
+}
+
+func preferSocketRecord(candidate, current socketRecord) bool {
+	candidateLive := candidate.ClosedAt.IsZero()
+	currentLive := current.ClosedAt.IsZero()
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	if !candidateLive && !candidate.ClosedAt.Equal(current.ClosedAt) {
+		return candidate.ClosedAt.After(current.ClosedAt)
+	}
+	return candidate.ID > current.ID
 }
 
 func (m *Manager) Snapshots() []Snapshot {
@@ -1549,6 +1634,8 @@ func (c *trackedInboundConn) Close() error {
 type trackedOutboundConn struct {
 	stdnet.Conn
 	once             sync.Once
+	manager          *Manager
+	socketID         uint64
 	release          func()
 	closeWaitTimeout time.Duration
 	timerMu          sync.Mutex
@@ -1566,9 +1653,40 @@ func (c *trackedOutboundConn) Read(buffer []byte) (int, error) {
 func (c *trackedOutboundConn) armCloseWaitTimer() {
 	c.timerMu.Lock()
 	if c.timer == nil {
-		c.timer = time.AfterFunc(c.closeWaitTimeout, func() { _ = c.Close() })
+		c.timer = time.AfterFunc(c.closeWaitTimeout, func() {
+			if c.manager != nil && c.manager.socketStillInState(c.socketID, tcpCloseWaitState) {
+				_ = c.Close()
+			}
+		})
 	}
 	c.timerMu.Unlock()
+}
+
+func (m *Manager) socketStillInState(socketID uint64, want string) bool {
+	if m == nil || socketID == 0 {
+		return false
+	}
+	m.mu.Lock()
+	record, exists := m.sockets[socketID]
+	if !exists || !record.ClosedAt.IsZero() {
+		m.mu.Unlock()
+		return false
+	}
+	tuple := record.Tuple
+	m.mu.Unlock()
+
+	kernelSockets, err := m.scanSockets()
+	if err != nil || kernelSockets[tuple] != want {
+		return false
+	}
+
+	// Re-check ownership after the kernel scan so a concurrent Close cannot
+	// cause the timer to act on a released or tuple-reused session.
+	m.mu.Lock()
+	current, exists := m.sockets[socketID]
+	ok := exists && current.ClosedAt.IsZero() && current.Tuple == tuple
+	m.mu.Unlock()
+	return ok
 }
 
 func (c *trackedOutboundConn) Close() error {

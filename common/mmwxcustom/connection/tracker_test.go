@@ -148,9 +148,7 @@ func TestUDPBypassUnattributedAndUserIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	local, peer := stdnet.Pipe()
-	defer peer.Close()
-	connA := leaseA.succeeded(local)
+	connA := leaseA.succeeded(newAddressedConn("10.0.0.1", 53000, "203.0.113.20", 443))
 	defer connA.Close()
 	if _, err := manager.acquire(userContext("in-a", "user-a"), destination); err == nil {
 		t.Fatal("active limit must reject attributed user")
@@ -220,6 +218,18 @@ type eofConn struct {
 	once   sync.Once
 }
 
+type notifyingAddressedConn struct {
+	*addressedConn
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *notifyingAddressedConn) Close() error {
+	c.addressedConn.closed = true
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
 type addressedConn struct {
 	local  *stdnet.TCPAddr
 	remote *stdnet.TCPAddr
@@ -285,8 +295,127 @@ func TestExactTupleAttributesInboundAndOutboundTimeWait(t *testing.T) {
 	kernel[inboundTuple] = tcpTimeWaitState
 	kernel[outboundTuple] = tcpTimeWaitState
 	got = findSnapshot(t, manager, identity)
-	if got.InboundActive != 0 || got.OutboundActive != 0 || got.InboundTCP.TimeWait != 1 || got.OutboundTCP.TimeWait != 1 {
+	if got.InboundActive != 0 || got.OutboundActive != 0 || got.InboundTCP.TimeWait != 1 || got.OutboundTCP.TimeWait != 1 || got.CurrentTotal != 2 {
 		t.Fatalf("TIME_WAIT tuple attribution failed: %#v", got)
+	}
+}
+
+func TestUnifiedTotalsIncludeExactStatesWithoutDuplicateSockets(t *testing.T) {
+	manager := NewManager()
+	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
+	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
+	if err := manager.ReplaceConfig(Config{ManagementMappings: []ManagementGroupMapping{
+		{Identity: identityA, Group: "ken"}, {Identity: identityB, Group: "ken"},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	inboundA := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10001, RemoteIP: netip.MustParseAddr("198.51.100.1"), RemotePort: 41001}
+	outboundA := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 51001, RemoteIP: netip.MustParseAddr("203.0.113.1"), RemotePort: 443}
+	inboundB := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10002, RemoteIP: netip.MustParseAddr("198.51.100.2"), RemotePort: 41002}
+	unknown := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 59999, RemoteIP: netip.MustParseAddr("192.0.2.99"), RemotePort: 22}
+	manager.scanSockets = func() (map[socketTuple]string, error) {
+		return map[socketTuple]string{
+			inboundA: tcpEstablishedState, outboundA: tcpTimeWaitState,
+			inboundB: tcpCloseWaitState, unknown: tcpEstablishedState,
+		}, nil
+	}
+
+	manager.mu.Lock()
+	manager.stateLocked(identityA, Snapshot{Identity: identityA, Attributed: true, ManagementGroup: "ken"})
+	manager.stateLocked(identityB, Snapshot{Identity: identityB, Attributed: true, ManagementGroup: "ken"})
+	manager.registerSocketLocked(identityA, inboundSocket, inboundA)
+	oldOutbound := manager.registerSocketLocked(identityA, outboundSocket, outboundA)
+	manager.closeSocketLocked(oldOutbound)
+	manager.registerSocketLocked(identityA, outboundSocket, outboundA) // tuple reuse: one kernel row
+	manager.registerSocketLocked(identityB, inboundSocket, inboundB)
+	manager.mu.Unlock()
+
+	users, global, groups, err := manager.FullSnapshotReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var total int64
+	for _, user := range users {
+		total += user.CurrentTotal
+	}
+	if total != 3 || global.CurrentTotal != 3 {
+		t.Fatalf("exact totals include unknown or duplicate sockets: users=%#v global=%#v", users, global)
+	}
+	if len(groups) != 1 || groups[0].CurrentTotal != 3 || groups[0].InboundTCP.Total != 2 || groups[0].OutboundTCP.TimeWait != 1 || groups[0].InboundTCP.CloseWait != 1 {
+		t.Fatalf("management user total is not the sum of exact port totals: %#v", groups)
+	}
+}
+
+func TestClosedSocketTombstoneAttributesLaterTimeWaitButDoesNotInventTotal(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "user-a"}
+	tuple := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10022, RemoteIP: netip.MustParseAddr("198.51.100.10"), RemotePort: 45000}
+	kernel := map[socketTuple]string{}
+	manager.scanSockets = func() (map[socketTuple]string, error) { return kernel, nil }
+	now := time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+
+	socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.releaseInbound(identity, socketID, "198.51.100.10")
+	got := findSnapshot(t, manager, identity)
+	if got.CurrentTotal != 0 {
+		t.Fatalf("absent tombstone was exposed as a TCP Total: %#v", got)
+	}
+
+	now = now.Add(30 * time.Second)
+	kernel[tuple] = tcpTimeWaitState
+	got = findSnapshot(t, manager, identity)
+	if got.CurrentTotal != 1 || got.InboundTCP.TimeWait != 1 {
+		t.Fatalf("later TIME_WAIT lost exact identity: %#v", got)
+	}
+
+	delete(kernel, tuple)
+	now = now.Add(time.Second)
+	if _, _, _, err := manager.FullSnapshotReport(); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(socketTombstoneRetention + time.Second)
+	if _, _, _, err := manager.FullSnapshotReport(); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.sockets) != 0 {
+		t.Fatalf("expired tombstone was not pruned: %#v", manager.sockets)
+	}
+}
+
+func TestTotalLimitIncludesTimeWaitAndCloseWaitAndOnlyRejectsNew(t *testing.T) {
+	manager := NewManager()
+	identity := Identity{InboundTag: "in-a", User: "proto-a"}
+	limit := int64(2)
+	if err := manager.ReplaceConfig(Config{PortLimits: []PortLimit{{InboundTag: identity.InboundTag, MaxTotalConnections: &limit}}}); err != nil {
+		t.Fatal(err)
+	}
+	timeWaitTuple := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 51001, RemoteIP: netip.MustParseAddr("203.0.113.1"), RemotePort: 443}
+	closeWaitTuple := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 51002, RemoteIP: netip.MustParseAddr("203.0.113.2"), RemotePort: 443}
+	manager.scanSockets = func() (map[socketTuple]string, error) {
+		return map[socketTuple]string{timeWaitTuple: tcpTimeWaitState, closeWaitTuple: tcpCloseWaitState}, nil
+	}
+	manager.mu.Lock()
+	manager.stateLocked(identity, Snapshot{Identity: identity, Attributed: true})
+	timeWaitID := manager.registerSocketLocked(identity, outboundSocket, timeWaitTuple)
+	manager.closeSocketLocked(timeWaitID)
+	manager.registerSocketLocked(identity, outboundSocket, closeWaitTuple)
+	manager.mu.Unlock()
+
+	got := findSnapshot(t, manager, identity)
+	if got.CurrentTotal != 2 || got.OutboundTCP.TimeWait != 1 || got.OutboundTCP.CloseWait != 1 {
+		t.Fatalf("terminal states not included in Total: %#v", got)
+	}
+	if _, err := manager.acquire(userContext(identity.InboundTag, identity.User), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)); err == nil {
+		t.Fatal("Total limit accepted a new controlled connection")
+	} else {
+		requireLimitReason(t, err, PortCombinedLimit)
+	}
+	if len(manager.sockets) != 2 {
+		t.Fatalf("Total limit removed existing sockets: %#v", manager.sockets)
 	}
 }
 
@@ -308,13 +437,18 @@ func TestAllTCPStatesRemainDistinct(t *testing.T) {
 func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	manager := NewManager()
 	userA := Identity{InboundTag: "in-a", User: "user-a"}
+	tupleA := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10001, RemoteIP: netip.MustParseAddr("198.51.100.1"), RemotePort: 41001}
+	tupleB := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10002, RemoteIP: netip.MustParseAddr("198.51.100.2"), RemotePort: 41002}
+	manager.scanSockets = func() (map[socketTuple]string, error) {
+		return map[socketTuple]string{tupleA: tcpEstablishedState, tupleB: tcpEstablishedState}, nil
+	}
 	if err := manager.ReplaceConfig(Config{
 		MaxGlobalTotalConnections: pointer[int64](3),
 		PortLimits:                []PortLimit{{InboundTag: userA.InboundTag, MaxOutboundTCPActive: pointer[int64](1)}},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), socketTuple{}); err != nil {
+	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), tupleA); err != nil {
 		t.Fatal(err)
 	}
 	leaseA, err := manager.acquire(userContext("in-a", "user-a"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443))
@@ -326,7 +460,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortTotalLimit {
 		t.Fatalf("unexpected user limit error: %v", err)
 	}
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-b", "user-b")), socketTuple{}); err != nil {
+	if _, err := manager.bindInbound(identityFromContext(userContext("in-b", "user-b")), tupleB); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.acquire(userContext("in-b", "user-b"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)); err == nil {
@@ -772,7 +906,8 @@ func TestManagementAndPortCombinedLimitsIncludeInboundAndOutbound(t *testing.T) 
 			if err := manager.ReplaceConfig(test.config); err != nil {
 				t.Fatal(err)
 			}
-			socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, socketTuple{})
+			tuple := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10001, RemoteIP: netip.MustParseAddr("198.51.100.1"), RemotePort: 41001}
+			socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -936,7 +1071,14 @@ func TestCloseWaitTimeoutOwnsAndClosesSessionSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := &eofConn{closed: make(chan struct{})}
+	base := &notifyingAddressedConn{
+		addressedConn: newAddressedConn("10.0.0.1", 53000, "203.0.113.20", 443),
+		closed:        make(chan struct{}),
+	}
+	tuple, _ := socketTupleFromConn(base)
+	manager.scanSockets = func() (map[socketTuple]string, error) {
+		return map[socketTuple]string{tuple: tcpCloseWaitState}, nil
+	}
 	conn := lease.succeeded(base)
 	if _, err := conn.Read(nil); err != io.EOF {
 		t.Fatalf("read error = %v, want EOF", err)
@@ -948,5 +1090,52 @@ func TestCloseWaitTimeoutOwnsAndClosesSessionSocket(t *testing.T) {
 	}
 	if got := findSnapshot(t, manager, identity); got.OutboundActive != 0 {
 		t.Fatalf("timeout did not release active count: %#v", got)
+	}
+}
+
+func TestCloseWaitTimeoutRechecksStateAndZeroDisables(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		timeout    *int64
+		state      string
+		wantClosed bool
+	}{
+		{name: "still close wait", timeout: pointer[int64](1), state: tcpCloseWaitState, wantClosed: true},
+		{name: "changed to time wait", timeout: pointer[int64](1), state: tcpTimeWaitState, wantClosed: false},
+		{name: "disabled", timeout: pointer[int64](0), state: tcpCloseWaitState, wantClosed: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := NewManager()
+			if err := manager.ReplaceConfig(Config{DefaultCloseWaitTimeoutSeconds: test.timeout}); err != nil {
+				t.Fatal(err)
+			}
+			lease, err := manager.acquire(userContext("in-a", "user-a"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443))
+			if err != nil {
+				t.Fatal(err)
+			}
+			base := &notifyingAddressedConn{
+				addressedConn: newAddressedConn("10.0.0.1", 53001, "203.0.113.21", 443),
+				closed:        make(chan struct{}),
+			}
+			tuple, _ := socketTupleFromConn(base)
+			manager.scanSockets = func() (map[socketTuple]string, error) {
+				return map[socketTuple]string{tuple: test.state}, nil
+			}
+			conn := lease.succeeded(base)
+			if _, err := conn.Read(nil); err != io.EOF {
+				t.Fatalf("read error = %v, want EOF", err)
+			}
+			select {
+			case <-base.closed:
+				if !test.wantClosed {
+					t.Fatal("timer closed a socket that was not still CLOSE_WAIT")
+				}
+			case <-time.After(1200 * time.Millisecond):
+				if test.wantClosed {
+					t.Fatal("timer did not close a socket still in CLOSE_WAIT")
+				}
+				_ = conn.Close()
+			}
+		})
 	}
 }
