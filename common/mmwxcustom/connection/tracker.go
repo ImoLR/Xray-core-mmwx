@@ -264,6 +264,13 @@ type socketRecord struct {
 	ClosedAt  time.Time
 }
 
+// Linux keeps actively closed TCP sockets observable in TIME_WAIT for roughly
+// one minute. Keep the identity/tuple association longer than that kernel
+// window so a transient scan miss cannot discard attribution before the socket
+// reaches TIME_WAIT. Records are still garbage-collected once the tuple has
+// disappeared for the full bounded retention period.
+const socketTombstoneRetention = 2 * time.Minute
+
 type Manager struct {
 	mu                    sync.Mutex
 	limits                map[Identity]Limit
@@ -1254,14 +1261,26 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 		result = append(result, copy)
 		m.states[identity] = item
 	}
+	// A kernel TCP table has one state per exact four-tuple. Socket reuse can
+	// leave an older tombstone and a newer live record with the same tuple, so
+	// select exactly one owner before aggregating. Prefer a live record, then the
+	// newest record, to avoid double-counting or attributing one physical socket
+	// to multiple identities.
+	ownedKernelSockets := make(map[socketTuple]socketRecord)
 	for socketID, record := range m.sockets {
-		stateCode, found := kernelSockets[record.Tuple]
+		_, found := kernelSockets[record.Tuple]
 		if !found {
-			if !record.ClosedAt.IsZero() && now.Sub(record.ClosedAt) >= 10*time.Second {
+			if !record.ClosedAt.IsZero() && now.Sub(record.ClosedAt) >= socketTombstoneRetention {
 				delete(m.sockets, socketID)
 			}
 			continue
 		}
+		if current, exists := ownedKernelSockets[record.Tuple]; !exists || preferSocketRecord(record, current) {
+			ownedKernelSockets[record.Tuple] = record
+		}
+	}
+	for tuple, record := range ownedKernelSockets {
+		stateCode := kernelSockets[tuple]
 		item := m.states[record.Identity]
 		if item == nil {
 			continue
@@ -1366,6 +1385,18 @@ func (m *Manager) FullSnapshotReport() ([]Snapshot, GlobalSnapshot, []Management
 	})
 	sort.Slice(groups, func(i, j int) bool { return groups[i].Group < groups[j].Group })
 	return result, global, groups, nil
+}
+
+func preferSocketRecord(candidate, current socketRecord) bool {
+	candidateLive := candidate.ClosedAt.IsZero()
+	currentLive := current.ClosedAt.IsZero()
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	if !candidateLive && !candidate.ClosedAt.Equal(current.ClosedAt) {
+		return candidate.ClosedAt.After(current.ClosedAt)
+	}
+	return candidate.ID > current.ID
 }
 
 func (m *Manager) Snapshots() []Snapshot {
