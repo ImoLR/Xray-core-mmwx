@@ -93,13 +93,22 @@ func (s *Server) processUDP(ctx context.Context, conn stat.Connection, dispatche
 	defer connCancel()
 
 	var mu sync.Mutex
+	// 会话结束后换成 nil 墓碑:释放 ARQ 等状态,又能认出同一 sessionID 迟到的重传包
+	// (尤其是重传的 openSessionRequest,不能再拨一次落地)。从前结束的会话一直留在表里,
+	// 一个长期复用的 UDP 连接上会话越积越多。
 	sessions := make(map[uint32]*udpServerSession)
 	defer func() {
 		mu.Lock()
+		live := make([]*udpServerSession, 0, len(sessions))
 		for _, us := range sessions {
-			us.shutdown()
+			if us != nil {
+				live = append(live, us)
+			}
 		}
 		mu.Unlock()
+		for _, us := range live {
+			us.shutdown()
+		}
 	}()
 
 	handle := func(pkt []byte) {
@@ -108,9 +117,17 @@ func (s *Server) processUDP(ctx context.Context, conn stat.Connection, dispatche
 			return // 丢弃坏包
 		}
 		mu.Lock()
-		us := sessions[seg.sessionID]
-		if us == nil && seg.protocolType == protoOpenSessionRequest {
+		us, seen := sessions[seg.sessionID]
+		if !seen && seg.protocolType == protoOpenSessionRequest {
 			us = newUDPServerSession(connCtx, seg.sessionID, user, username, aead, writePkt, base, dispatcher)
+			id, self := seg.sessionID, us
+			us.onShutdown = func() {
+				mu.Lock()
+				if sessions[id] == self {
+					sessions[id] = nil
+				}
+				mu.Unlock()
+			}
 			sessions[seg.sessionID] = us
 			go us.consume()
 		}
@@ -159,6 +176,13 @@ type udpServerSession struct {
 	dispatcher routing.Dispatcher
 	link       *transport.Link
 	closeOnce  sync.Once
+	onShutdown func()
+
+	// socks5 请求还没到齐时攒在这里(NO_WAIT 客户端的 openSessionRequest 是空的,
+	// 目标地址在随后的 data 段里)。与 TCP 路径(server.go 的 pendingOpen)同一套处理。
+	awaitingOpen  bool
+	pendingOpen   []byte
+	openResponded bool // openSessionResponse 已经提前回过
 }
 
 func newUDPServerSession(ctx context.Context, id uint32, user *protocol.MemoryUser, username string,
@@ -184,8 +208,8 @@ func (us *udpServerSession) consume() {
 		}
 		switch seg.protocolType {
 		case protoOpenSessionRequest:
-			if us.link == nil {
-				if !us.handleOpen(seg) {
+			if us.link == nil && !us.awaitingOpen {
+				if !us.tryOpen(seg.payload) {
 					us.shutdown()
 					return
 				}
@@ -193,6 +217,12 @@ func (us *udpServerSession) consume() {
 		case protoDataClientToServer:
 			if us.link != nil && len(seg.payload) > 0 {
 				if werr := us.link.Writer.WriteMultiBuffer(bytesToMultiBuffer(seg.payload)); werr != nil {
+					us.shutdown()
+					return
+				}
+			} else if us.link == nil && us.awaitingOpen {
+				us.pendingOpen = append(us.pendingOpen, seg.payload...)
+				if len(us.pendingOpen) > maxPendingSocks5Bytes || !us.tryOpen(us.pendingOpen) {
 					us.shutdown()
 					return
 				}
@@ -205,11 +235,43 @@ func (us *udpServerSession) consume() {
 	}
 }
 
+// tryOpen 用目前攒到的字节尝试建会话。socks5 请求还不完整时记下来等后续 data 段,返回 true;
+// 只有确定建不起来(不是 socks5 CONNECT、dispatch 失败、回包失败)才返回 false。
+//
+// NO_WAIT 客户端(mihomo 等)没有应用数据时先发一个空 openSessionRequest。UDP underlay 上
+// 官方客户端要等到 openSessionResponse 才会把后面的 data 段(socks5 请求 + 首包)发出来,
+// 所以这时必须**先回 openSessionResponse**,再等 socks5 请求;等 socks5 到齐再回响应就成了
+// 互相等待。从前更糟:空 open 直接判失败关掉会话。两种情况下 HTTPS(含 mihomo 默认的延迟
+// 测试)都是超时,表现为「mieru 节点 ping 不通」(#1078)。TCP underlay 的客户端不等这个响应。
+func (us *udpServerSession) tryOpen(payload []byte) bool {
+	opened, needMore := us.handleOpen(payload)
+	if opened {
+		us.awaitingOpen, us.pendingOpen = false, nil
+		return true
+	}
+	if needMore {
+		if !us.awaitingOpen {
+			us.awaitingOpen = true
+			us.pendingOpen = append([]byte(nil), payload...)
+			if err := us.sendSession(protoOpenSessionResponse); err != nil {
+				return false
+			}
+			us.openResponded = true
+		}
+		return true
+	}
+	return false
+}
+
 // handleOpen 解析 socks5 目标 → dispatch → 回 openSessionResponse + socks5 成功回复 + 初始数据 → 启动 pump。
-func (us *udpServerSession) handleOpen(seg *segment) bool {
-	dest, cmd, consumed, perr := parseSocks5Request(seg.payload)
-	if perr != nil || cmd != socks5CmdConnect {
-		return false
+// needMore=true 表示 socks5 请求还没到齐。
+func (us *udpServerSession) handleOpen(payload []byte) (opened, needMore bool) {
+	dest, cmd, consumed, perr := parseSocks5Request(payload)
+	if perr != nil {
+		return false, perr == errSocks5Incomplete
+	}
+	if cmd != socks5CmdConnect {
+		return false, false
 	}
 	ib := session.Inbound{}
 	if us.base != nil {
@@ -221,23 +283,25 @@ func (us *udpServerSession) handleOpen(seg *segment) bool {
 	sctx := session.ContextWithInbound(us.ctx, &ib)
 	link, derr := us.dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
 	if derr != nil {
-		return false
+		return false, false
 	}
 	us.link = link
 
-	if err := us.sendSession(protoOpenSessionResponse); err != nil {
-		return false
+	if !us.openResponded {
+		if err := us.sendSession(protoOpenSessionResponse); err != nil {
+			return false, false
+		}
 	}
 	if err := us.sendData(socks5SuccessReplyIPv4); err != nil {
-		return false
+		return false, false
 	}
-	if consumed < len(seg.payload) {
-		if err := us.link.Writer.WriteMultiBuffer(bytesToMultiBuffer(seg.payload[consumed:])); err != nil {
-			return false
+	if consumed < len(payload) {
+		if err := us.link.Writer.WriteMultiBuffer(bytesToMultiBuffer(payload[consumed:])); err != nil {
+			return false, false
 		}
 	}
 	go us.pump()
-	return true
+	return true, false
 }
 
 // pump 读落地响应,分片成 dataServerToClient 段经 ARQ 可靠发出。
@@ -293,6 +357,9 @@ func (us *udpServerSession) shutdown() {
 		if us.link != nil {
 			common.Interrupt(us.link.Reader)
 			common.Interrupt(us.link.Writer)
+		}
+		if us.onShutdown != nil {
+			us.onShutdown()
 		}
 	})
 }
