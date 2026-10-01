@@ -13,7 +13,6 @@ import (
 
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/uot"
-	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	xlog "github.com/xtls/xray-core/common/log"
@@ -67,20 +66,24 @@ type session struct {
 	dieHook       func()
 }
 
-func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedReader, length int) error {
+// handlePSH 读完帧体写进流。readErr 是读会话连接失败,整条会话要结束;
+// writeErr 是这条流写不进去了(帧体已读完),只影响这一条流。
+func (s *session) handlePSH(ctx context.Context, st *stream, br *buf.BufferedReader, length int) (readErr, writeErr error) {
 	if st == nil || st.link == nil {
-		return errors.New("anytls: received PSH for unknown stream")
+		// 帧体没读,不能当成单流错误接着读(会错帧),按会话级错误处理。
+		return errors.New("anytls: received PSH for unknown stream"), nil
 	}
 	body, err := readMultiBufferExact(br, length)
 	if err != nil {
 		buf.ReleaseMulti(body)
-		return err
+		return err, nil
 	}
-
-	if err := st.link.Writer.WriteMultiBuffer(body); err != nil {
-		return err
+	if st.up != nil {
+		// 服务端:入队就返回,由 writeUplink 去写(见其注释)。只有队列满了才在这里等。
+		// 返回错误说明这条流已在别处结束(队列已中止)。
+		return nil, st.up.push(body)
 	}
-	return nil
+	return nil, st.link.Writer.WriteMultiBuffer(body)
 }
 
 // accessLogCtx 给**这一条流**挂上访问日志,返回流内局部 ctx。
@@ -109,6 +112,16 @@ func accessLogCtx(ctx context.Context, dest net.Destination) context.Context {
 	})
 }
 
+// streamContext 给一条流派生它自己的 dispatch ctx:
+//   - 独立可取消:dispatcher 对它注册 online-IP 的 RemoveIP,流结束时取消即实时清理(#731);
+//   - 独立的 session.Outbound / Content(同 xray mux 服务端对每条子连接的做法):dispatcher 把这条流的
+//     目标写进 Outbound,出站要到自己的 goroutine 里才去读。整条会话共用连接 ctx 里那一个的话,紧挨着
+//     分发的两条流会互相覆盖,前一条被连到后一条的目标上。这本是老问题;上行改成异步入队后 readLoop
+//     会一口气分发一串新流,UoT 流又在自己的 goroutine 里分发,就从偶发变成了常态。
+func streamContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(sessionctx.SubContextFromMuxInbound(ctx))
+}
+
 func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.BufferedReader) error {
 	addr, err := M.SocksaddrSerializer.ReadAddrPort(br)
 	if err != nil {
@@ -122,34 +135,42 @@ func (s *session) handleNewStream(ctx context.Context, st *stream, br *buf.Buffe
 	// Check for UDP-over-TCP v2 magic domain in a new stream request.
 	if strings.Contains(dest.Address.String(), "udp-over-tcp.arpa") {
 		st.isUDP = true
-		// canonical 客户端(非 fork xray):走 full-cone uot 路径 —— 建 per-stream pipe,
-		// 后续 PSH 帧体全喂进 pipe,由 handleUDPStream 逐包解目标写进单条 freedom link。
+		// canonical 客户端(非 fork xray):走 full-cone uot 路径 —— 后续 PSH 帧体全进这条流的上行队列,
+		// 由 handleUDPStream 逐包解目标写进单条 freedom link。
 		// fork 自身客户端仍走 raw 路径(handleFirstUDPFrame/handlePSH),行为不变。
 		if !s.peerIsXrayClient {
 			st.udpPipe = true
-			st.uplinkR, st.uplinkW = io.Pipe()
+			st.up = newUplinkQueue()
+			// dispatch ctx 在 readLoop 里建好、挂上 st.cancel,再交给 handleUDPStream 去 Dispatch:
+			// 流在别处结束时 st.close 取消它,打断卡在等限速令牌上的写;handleUDPStream 不再回写 st 的字段,
+			// 也就不会和会话关闭时的 st.close 并发读写。
+			sctx, cancel := streamContext(ctx)
+			st.cancel = cancel
+			// 先起消费方再发 SYNACK:SYNACK 发送失败时 readLoop 并不退出,没人取的队列满了会把它永远卡住。
+			go s.handleUDPStream(sctx, st)
 		}
 		if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 			errors.LogWarning(ctx, "anytls: UDP SYNACK send error, streamId=", st.sid, " err=", err)
 			return err
-		}
-		if st.udpPipe {
-			go s.handleUDPStream(ctx, st)
 		}
 		return nil
 	}
 
 	// 每条流用独立可取消 ctx 去 Dispatch:dispatcher 会对该 ctx 注册 online-IP 的 RemoveIP,
 	// 流结束时取消它即实时清理在线 IP,而不必等整个 anytls 会话(可能被连接池长期保活)关闭(#731)。
-	sctx, cancel := context.WithCancel(ctx)
+	sctx, cancel := streamContext(ctx)
 	l, err := s.dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
 	if err != nil {
 		cancel()
 		errors.LogWarning(ctx, "anytls: new stream dispatcher error, streamId=", st.sid, " err=", err)
+		s.rejectStream(st.sid, err)
 		return nil
 	}
 	st.cancel = cancel
 	st.link = l
+	// 同 UoT:写 goroutine 必须在发 SYNACK 之前起好。
+	st.up = newUplinkQueue()
+	go s.writeUplink(st)
 
 	if err := s.sendFrame(newFrame(cmdSYNACK, st.sid)); err != nil {
 		errors.LogWarning(ctx, "anytls: new stream SYNACK send error, streamId=", st.sid, " err=", err)
@@ -171,7 +192,7 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		}
 		requestDest := singbridge.ToDestination(request.Destination, net.Network_UDP)
 
-		sctx, cancel := context.WithCancel(ctx)
+		sctx, cancel := streamContext(ctx)
 		link, err := s.dispatcher.Dispatch(accessLogCtx(sctx, requestDest), requestDest)
 		if err != nil {
 			cancel()
@@ -184,6 +205,8 @@ func (s *session) handleFirstUDPFrame(ctx context.Context, st *stream, br *buf.B
 		st.cancel = cancel
 		st.link = link
 		st.udpTarget = &requestDest
+		st.up = newUplinkQueue()
+		go s.writeUplink(st)
 
 		go s.pumpDownlink(st.sid, link)
 		return nil
@@ -199,14 +222,9 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 		delete(s.streams, sid)
 		s.streamsMu.Unlock()
 		if st != nil {
-			// 下行泵结束=该流关闭,取消其 dispatch ctx 触发 RemoveIP(#731)。
-			if st.cancel != nil {
-				st.cancel()
-			}
-			if st.link != nil {
-				common.Close(st.link.Writer)
-				common.Close(st.link.Reader)
-			}
+			// 下行泵结束=该流关闭:st.close 取消其 dispatch ctx 触发 RemoveIP(#731)、
+			// 关 link,并中止上行队列(目标都走了,还没写出去的上行没有意义)。
+			st.close(nil)
 		}
 		if !s.isClosed() {
 			_ = s.sendFrame(newFrame(cmdFIN, sid))
@@ -223,6 +241,34 @@ func (s *session) pumpDownlink(sid uint32, link *transport.Link) {
 			return
 		}
 	}
+}
+
+// writeUplink 是服务端一条流(普通 TCP 流、fork 客户端的 raw UDP 流)的上行写 goroutine:
+// 按序把 st.up 里的帧体写进 link.Writer。
+//
+// 从前这一步在 readLoop 里同步做。用户限速时同一用户上下行、所有连接共用一个令牌桶,下载把桶打成
+// 负债后,上行哪怕几个字节的写也要排队等令牌,一等就是秒级 —— 整条会话的读循环跟着停住,新流的
+// SYN / 首帧没人处理,SYNACK 发不出去,sing-anytls 客户端(mihomo / sing-box)开新流 3 秒等不到
+// SYNACK 就关掉整条会话。现在限速和出站慢都只卡这一条流。
+//
+// 收尾:
+//   - 客户端 FIN:readLoop 只 closeWrite,已入队的数据照常写完、拿到 io.EOF 后才在这里 finishStream
+//     关 link —— FIN 不能抢在还没写出去的上行数据前面把它丢掉(从前同步写时 FIN 本就排在它们后面)。
+//   - 写失败:只结束这一条流(同从前 handlePSH 的 writeErr),剩余缓冲由 st.close 中止队列时释放。
+//   - 流在别处结束(下行结束 / 会话关闭):队列已中止,取队返回 ErrClosedPipe;流已不在 map 里,
+//     这里的 finishStream 是空操作。
+func (s *session) writeUplink(st *stream) {
+	var werr error
+	for {
+		mb, err := st.up.ReadMultiBuffer()
+		if err != nil {
+			break
+		}
+		if werr = st.link.Writer.WriteMultiBuffer(mb); werr != nil {
+			break
+		}
+	}
+	s.finishStream(st.sid, werr)
 }
 
 func (s *session) isClosed() bool {
@@ -273,6 +319,21 @@ func (s *session) finishStream(sid uint32, err error) {
 		s.activeStreams.Add(-1)
 	}
 	st.close(err)
+}
+
+// rejectStream:新流分发被拒(限速的并发连接上限等)时告诉客户端,只结束这一条流,同参考实现
+// HandshakeFailure 之后 Close:v2 对端先回带错误信息的 SYNACK,sing-anytls / mihomo 只关这条流
+// (remote: ...);再发 FIN,不认 SYNACK 的 v1 对端靠它收流(带帧体的未知命令会读乱 v1 的帧)。
+//
+// 从前什么都不回、流也留在 map 里:客户端开新流后 3 秒等不到 SYNACK,把整条会话连同上面其它
+// 在跑的流一起关掉;客户端不等 SYNACK 就发出的首包还会被当成新流地址解析,把会话的帧读乱。
+// 错误详情只进本地日志:dispatcher 的错误文本带 email。
+func (s *session) rejectStream(sid uint32, err error) {
+	s.finishStream(sid, err)
+	if s.peerVersion >= 2 {
+		_ = s.sendFrame(&frame{cmd: cmdSYNACK, sid: sid, data: []byte("stream rejected")})
+	}
+	_ = s.sendFrame(newFrame(cmdFIN, sid))
 }
 
 func (s *session) sendFrame(f *frame) error {
@@ -448,12 +509,15 @@ func (s *session) readLoop(ctx context.Context) error {
 			s.streamsMu.Lock()
 			st := s.streams[sid]
 			s.streamsMu.Unlock()
-			if st == nil {
-				err := errors.New("anytls: received PSH for unknown stream, streamId=", sid)
-				s.finishStream(sid, err)
-				return nil
+			if st == nil || st.finRecv {
+				// 流已经结束(FIN 过 / 被踢)后客户端还在路上的数据:丢掉这一帧接着读,同参考实现。
+				// 从前这里 return nil 把整条会话拆了,同一会话上的其它流全部跟着断。
+				if err := discardBytes(s.br, length); err != nil {
+					return err
+				}
+				continue
 			} else if st.udpPipe {
-				// canonical full-cone 路径:帧体喂进 per-stream pipe,由 handleUDPStream 解码。
+				// canonical full-cone 路径:帧体进这条流的上行队列,由 handleUDPStream 解码。
 				if err := s.feedUDPUplink(st, length); err != nil {
 					return err
 				}
@@ -467,8 +531,13 @@ func (s *session) readLoop(ctx context.Context) error {
 				s.handleNewStream(ctx, st, s.br)
 				continue
 			}
-			if err := s.handlePSH(ctx, st, s.br, length); err != nil {
-				return err
+			readErr, writeErr := s.handlePSH(ctx, st, s.br, length)
+			if readErr != nil {
+				return readErr
+			}
+			if writeErr != nil {
+				// 这条流的 link 已关(流结束 / 被限速踢掉),帧体已经读完:只结束这一条流,会话照常。
+				s.finishStream(sid, writeErr)
 			}
 		case cmdFIN:
 			if length > 0 {
@@ -476,7 +545,20 @@ func (s *session) readLoop(ctx context.Context) error {
 					return err
 				}
 			}
-			s.finishStream(sid, nil)
+			s.streamsMu.Lock()
+			st := s.streams[sid]
+			s.streamsMu.Unlock()
+			if st != nil && st.up != nil {
+				// 有上行队列的流:FIN 只表示不会再有新数据。已入队的先写完,由消费方(writeUplink /
+				// handleUDPStream)取到 io.EOF 后自己 finishStream;在这里直接 finishStream 会把
+				// 还没写出去的上行丢掉。
+				if !st.finRecv {
+					st.finRecv = true
+					st.up.closeWrite()
+				}
+			} else {
+				s.finishStream(sid, nil)
+			}
 		case cmdSYNACK:
 			if !s.isClient {
 				if length > 0 {

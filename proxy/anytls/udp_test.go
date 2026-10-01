@@ -43,6 +43,15 @@ type eofReader struct{}
 
 func (eofReader) ReadMultiBuffer() (buf.MultiBuffer, error) { return nil, io.EOF }
 
+// queueWriter 把每次 Write 作为一帧帧体放进上行队列,模拟 readLoop 收到的 PSH 帧。
+type queueWriter struct{ q *uplinkQueue }
+
+func (w queueWriter) Write(p []byte) (int, error) {
+	b := buf.New()
+	b.Write(p)
+	return len(p), w.q.push(buf.MultiBuffer{b})
+}
+
 type fakeDispatcher struct{ link *transport.Link }
 
 func (fakeDispatcher) Type() interface{} { return nil }
@@ -64,14 +73,13 @@ func TestUDPFullconeUplinkPerPacketDest(t *testing.T) {
 		dispatcher: fakeDispatcher{link: link},
 		streams:    make(map[uint32]*stream),
 	}
-	st := &stream{sid: 1, udpPipe: true}
-	st.uplinkR, st.uplinkW = io.Pipe()
+	st := &stream{sid: 1, udpPipe: true, up: newUplinkQueue()}
 	s.streams[1] = st
 
 	go s.handleUDPStream(context.Background(), st)
 
 	// 编码:not-connected 请求(占位目标)+ 两个发往不同目标的包(与 sing uot WritePacket 一致)。
-	w := st.uplinkW
+	w := queueWriter{st.up}
 	if err := uot.WriteRequest(w, uot.Request{IsConnect: false, Destination: M.ParseSocksaddr("8.8.8.8:53")}); err != nil {
 		t.Fatalf("write request: %v", err)
 	}
@@ -98,7 +106,7 @@ func TestUDPFullconeUplinkPerPacketDest(t *testing.T) {
 			t.Fatalf("timeout waiting packet %d, got so far: %v", i, got)
 		}
 	}
-	st.uplinkW.Close()
+	st.up.closeWrite()
 
 	for d, p := range want {
 		if got[d] != p {

@@ -99,5 +99,10 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	inb.User = user
 	inb.CanSpliceCopy = 3
 
-	return sess.readLoop(ctx)
+	// readLoop 返回后必须收掉整条会话:断网 / 切网 / 客户端直接杀会话时不会逐流发 FIN,
+	// 标准 UoT 流的 handleUDPStream 一直卡在读 pipe 上,连同 session、TLS 连接、缓冲区一起
+	// 永远留在内存里(限速踢连接、SYNACK 超时都会造成这种断法,开限速后内存只涨不降)。
+	err := sess.readLoop(ctx)
+	sess.close(err)
+	return err
 }
