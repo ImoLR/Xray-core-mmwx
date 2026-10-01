@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/snell"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/udp"
 )
@@ -93,6 +94,14 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 
 	switch network {
 	case net.Network_TCP:
+		// simple-obfs 在 SS 握手之下:先剥掉混淆再读请求头。UDP 不混淆(与 mihomo 语义一致)。
+		if s.config.ObfsMode != "" {
+			obfsConn, err := snell.NewObfsServerConn(conn, s.config.ObfsMode, s.config.ObfsHost)
+			if err != nil {
+				return err
+			}
+			conn = obfsConn
+		}
 		return s.handleConnection(ctx, conn, dispatcher)
 	case net.Network_UDP:
 		return s.handleUDPPayload(ctx, conn, dispatcher)

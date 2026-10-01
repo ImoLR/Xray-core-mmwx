@@ -10,6 +10,7 @@ import (
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
 	"github.com/xtls/xray-core/proxy/shadowsocks_2022"
+	"github.com/xtls/xray-core/proxy/snell"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -46,10 +47,19 @@ type ShadowsocksServerConfig struct {
 	Email       string                   `json:"email"`
 	Users       []*ShadowsocksUserConfig `json:"clients"`
 	NetworkList *NetworkList             `json:"network"`
+	// simple-obfs 混淆(http / tls),放 settings 顶层,只作用于 TCP;与 mihomo `plugin: obfs` 互通。
+	// obfsPath 只给客户端用(http 模式的请求路径),服务端不校验路径,这里只接收不使用。
+	ObfsMode string `json:"obfsMode"`
+	ObfsHost string `json:"obfsHost"`
+	ObfsPath string `json:"obfsPath"`
 }
 
 func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 	errors.PrintNonRemovalDeprecatedFeatureWarning("Shadowsocks (with no Forward Secrecy, etc.)", "VLESS Encryption")
+
+	if err := snell.ValidObfsMode(v.ObfsMode); err != nil {
+		return nil, errors.New("shadowsocks: invalid obfsMode").Base(err)
+	}
 
 	if C.Contains(shadowaead_2022.List, v.Cipher) {
 		return buildShadowsocks2022(v)
@@ -57,6 +67,7 @@ func (v *ShadowsocksServerConfig) Build() (proto.Message, error) {
 
 	config := new(shadowsocks.ServerConfig)
 	config.Network = v.NetworkList.Build()
+	config.ObfsMode, config.ObfsHost = v.ObfsMode, v.ObfsHost
 
 	if v.Users != nil {
 		for _, user := range v.Users {
@@ -105,6 +116,7 @@ func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
 		config.Key = v.Password
 		config.Network = v.NetworkList.Build()
 		config.Email = v.Email
+		config.ObfsMode, config.ObfsHost = v.ObfsMode, v.ObfsHost
 		return config, nil
 	}
 
@@ -120,6 +132,7 @@ func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
 		config.Method = v.Cipher
 		config.Key = v.Password
 		config.Network = v.NetworkList.Build()
+		config.ObfsMode, config.ObfsHost = v.ObfsMode, v.ObfsHost
 
 		for _, user := range v.Users {
 			if user.Cipher != "" {
@@ -137,6 +150,9 @@ func buildShadowsocks2022(v *ShadowsocksServerConfig) (proto.Message, error) {
 		return config, nil
 	}
 
+	if v.ObfsMode != "" && !strings.EqualFold(v.ObfsMode, "none") {
+		return nil, errors.New("shadowsocks 2022 (relay): obfs is not supported")
+	}
 	config := new(shadowsocks_2022.RelayServerConfig)
 	config.Method = v.Cipher
 	config.Key = v.Password
