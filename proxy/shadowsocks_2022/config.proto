@@ -16,6 +16,9 @@ message ServerConfig {
   string email = 3;
   int32 level = 4;
   repeated xray.common.net.Network network = 5;
+  // simple-obfs 混淆(http / tls,空 = 不开),只作用于 TCP;与 mihomo `plugin: obfs` 互通。
+  string obfs_mode = 6;
+  string obfs_host = 7;
 }
 
 message MultiUserServerConfig {
@@ -23,6 +26,8 @@ message MultiUserServerConfig {
   string key = 2;
   repeated xray.common.protocol.User users = 3;
   repeated xray.common.net.Network network = 4;
+  string obfs_mode = 5;
+  string obfs_host = 6;
 }
 
 message RelayDestination {

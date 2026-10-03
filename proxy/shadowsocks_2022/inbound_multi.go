@@ -25,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/common/uuid"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/snell"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -39,6 +40,8 @@ type MultiUserInbound struct {
 	networks []net.Network
 	users    []*protocol.MemoryUser
 	service  *shadowaead_2022.MultiService[int]
+	obfsMode string
+	obfsHost string
 }
 
 func (i *MultiUserInbound) ConnectionInboundName() string { return "shadowsocks-2022-multi" }
@@ -67,6 +70,8 @@ func NewMultiServer(ctx context.Context, config *MultiUserServerConfig) (*MultiU
 	inbound := &MultiUserInbound{
 		networks: networks,
 		users:    memUsers,
+		obfsMode: config.ObfsMode,
+		obfsHost: config.ObfsHost,
 	}
 	if config.Key == "" {
 		return nil, errors.New("missing key")
@@ -202,6 +207,14 @@ func (i *MultiUserInbound) Process(ctx context.Context, network net.Network, con
 	ctx = session.ContextWithDispatcher(ctx, dispatcher)
 
 	if network == net.Network_TCP {
+		// simple-obfs 在 SS 握手之下:先剥掉混淆再交给 sing-shadowsocks。UDP 不混淆。
+		if i.obfsMode != "" {
+			obfsConn, err := snell.NewObfsServerConn(connection, i.obfsMode, i.obfsHost)
+			if err != nil {
+				return err
+			}
+			connection = obfsConn
+		}
 		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
 	} else {
 		reader := buf.NewReader(connection)

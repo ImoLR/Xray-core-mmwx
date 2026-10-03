@@ -52,3 +52,7 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+// sing v0.5.1 打了一处补丁(udpnat 发送不再无限阻塞,见 third_party/sing/MMWX_PATCH.md)。
+// 依赖方的 replace 在编 agent 时不生效,agent 的 go.mod 里要有同样一行(路径换成 ../xray-core-vision-limiter/third_party/sing)。
+replace github.com/sagernet/sing => ./third_party/sing

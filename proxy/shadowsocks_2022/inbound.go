@@ -20,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/singbridge"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/proxy/snell"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -34,6 +35,8 @@ type Inbound struct {
 	service  shadowsocks.Service
 	email    string
 	level    int
+	obfsMode string
+	obfsHost string
 }
 
 func (i *Inbound) ConnectionInboundName() string { return "shadowsocks-2022" }
@@ -57,6 +60,8 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Inbound, error) {
 		networks: networks,
 		email:    config.Email,
 		level:    int(config.Level),
+		obfsMode: config.ObfsMode,
+		obfsHost: config.ObfsHost,
 	}
 	if !C.Contains(shadowaead_2022.List, config.Method) {
 		return nil, errors.New("unsupported method ", config.Method)
@@ -86,6 +91,14 @@ func (i *Inbound) Process(ctx context.Context, network net.Network, connection s
 	ctx = session.ContextWithDispatcher(ctx, dispatcher)
 
 	if network == net.Network_TCP {
+		// simple-obfs 在 SS 握手之下:先剥掉混淆再交给 sing-shadowsocks。UDP 不混淆。
+		if i.obfsMode != "" {
+			obfsConn, err := snell.NewObfsServerConn(connection, i.obfsMode, i.obfsHost)
+			if err != nil {
+				return err
+			}
+			connection = obfsConn
+		}
 		return singbridge.ReturnError(i.service.NewConnection(ctx, connection, metadata))
 	} else {
 		reader := buf.NewReader(connection)
