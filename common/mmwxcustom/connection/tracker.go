@@ -292,6 +292,7 @@ type Manager struct {
 	mu                    sync.Mutex
 	limits                map[Identity]Limit
 	blockedIdentities     map[Identity]struct{}
+	inboundConns          map[*trackedInboundConn]Identity
 	states                map[Identity]*state
 	inbounds              map[string]ConfiguredInbound
 	defaultCW             *int64
@@ -319,6 +320,7 @@ func NewManager() *Manager {
 	return &Manager{
 		limits:             make(map[Identity]Limit),
 		blockedIdentities:  make(map[Identity]struct{}),
+		inboundConns:       make(map[*trackedInboundConn]Identity),
 		states:             make(map[Identity]*state),
 		inbounds:           make(map[string]ConfiguredInbound),
 		managementMappings: make(map[Identity]string),
@@ -349,6 +351,7 @@ func (m *Manager) Reset() {
 	m.mu.Lock()
 	m.limits = make(map[Identity]Limit)
 	m.blockedIdentities = make(map[Identity]struct{})
+	m.inboundConns = make(map[*trackedInboundConn]Identity)
 	m.states = make(map[Identity]*state)
 	m.inbounds = make(map[string]ConfiguredInbound)
 	m.defaultCW = nil
@@ -537,6 +540,13 @@ func (m *Manager) ReplaceConfig(config Config) error {
 		portLimits[limit.InboundTag] = clonePortLimit(limit)
 	}
 	m.mu.Lock()
+	var toClose []*trackedInboundConn
+	for conn, identity := range m.inboundConns {
+		_, wasBlocked := m.blockedIdentities[identity]
+		if _, nowBlocked := blocked[identity]; nowBlocked && !wasBlocked {
+			toClose = append(toClose, conn)
+		}
+	}
 	m.limits = replacement
 	m.blockedIdentities = blocked
 	m.managementMappings = mappings
@@ -580,6 +590,11 @@ func (m *Manager) ReplaceConfig(config Config) error {
 		}
 	}
 	m.mu.Unlock()
+	// Close outside the manager lock: tracked connections release their ownership
+	// and counters through the same manager when the session shuts down.
+	for _, conn := range toClose {
+		_ = conn.Close()
+	}
 	return nil
 }
 
@@ -1192,9 +1207,10 @@ func (m *Manager) releaseOutbound(identity Identity, socketID uint64) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, error) {
+func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple, conn *trackedInboundConn) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	owner := identity.Identity
 	identity = m.effectiveIdentityLocked(identity)
 	key := identity.Identity
 	item := m.stateLocked(key, identity)
@@ -1218,11 +1234,18 @@ func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, err
 	item.snapshot.InboundActive++
 	item.snapshot.InboundTotal++
 	m.globalCurrent++
+	if conn != nil {
+		// Keep the authenticated owner even when a tag-only identity has no
+		// mapping yet; accounting may use the unattributed bucket in that case.
+		m.inboundConns[conn] = owner
+		conn.identity = key
+	}
 	return m.registerSocketLocked(key, inboundSocket, tuple), nil
 }
 
-func (m *Manager) releaseInbound(identity Identity, socketID uint64, source string) {
+func (m *Manager) releaseInbound(identity Identity, socketID uint64, source string, conn *trackedInboundConn) {
 	m.mu.Lock()
+	delete(m.inboundConns, conn)
 	if item := m.states[identity]; item != nil && item.snapshot.InboundActive > 0 {
 		item.snapshot.InboundActive--
 		if m.globalCurrent > 0 {
@@ -1635,14 +1658,13 @@ func (c *trackedInboundConn) bind(identity Snapshot) error {
 		c.mu.Unlock()
 		return nil
 	}
-	socketID, err := c.manager.bindInbound(identity, c.tuple)
+	socketID, err := c.manager.bindInbound(identity, c.tuple, c)
 	if err != nil {
 		c.rejectErr = err
 		c.mu.Unlock()
 		return err
 	}
 	c.bound = true
-	c.identity = identity.Identity
 	c.socketID = socketID
 	c.source = normalizedSourceIP(c.tuple.RemoteIP)
 	c.mu.Unlock()
@@ -1660,7 +1682,7 @@ func (c *trackedInboundConn) Close() error {
 		source := c.source
 		c.mu.Unlock()
 		if bound {
-			c.manager.releaseInbound(identity, socketID, source)
+			c.manager.releaseInbound(identity, socketID, source, c)
 		}
 	})
 	return err

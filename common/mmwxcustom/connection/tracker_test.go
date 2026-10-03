@@ -260,7 +260,7 @@ func TestExactTupleAttributesInboundAndOutboundTimeWait(t *testing.T) {
 
 	inboundBase := newAddressedConn("10.0.0.1", 10022, "198.51.100.10", 45000)
 	inboundTuple, _ := socketTupleFromConn(inboundBase)
-	inboundID, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), inboundTuple)
+	inboundID, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), inboundTuple, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestExactTupleAttributesInboundAndOutboundTimeWait(t *testing.T) {
 		t.Fatalf("established tuple attribution failed: %#v", got)
 	}
 
-	manager.releaseInbound(identity, inboundID, normalizedSourceIP(inboundTuple.RemoteIP))
+	manager.releaseInbound(identity, inboundID, normalizedSourceIP(inboundTuple.RemoteIP), nil)
 	inboundLease.release()
 	if err := outbound.Close(); err != nil {
 		t.Fatal(err)
@@ -355,11 +355,11 @@ func TestClosedSocketTombstoneAttributesLaterTimeWaitButDoesNotInventTotal(t *te
 	now := time.Date(2026, 9, 27, 0, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
 
-	socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple)
+	socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager.releaseInbound(identity, socketID, "198.51.100.10")
+	manager.releaseInbound(identity, socketID, "198.51.100.10", nil)
 	got := findSnapshot(t, manager, identity)
 	if got.CurrentTotal != 0 {
 		t.Fatalf("absent tombstone was exposed as a TCP Total: %#v", got)
@@ -448,7 +448,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), tupleA); err != nil {
+	if _, err := manager.bindInbound(identityFromContext(userContext("in-a", "user-a")), tupleA, nil); err != nil {
 		t.Fatal(err)
 	}
 	leaseA, err := manager.acquire(userContext("in-a", "user-a"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443))
@@ -460,7 +460,7 @@ func TestUserAndGlobalTotalLimitsCountOnlyOwnedResources(t *testing.T) {
 	} else if limitErr := new(LimitError); !errors.As(err, &limitErr) || limitErr.Reason != PortTotalLimit {
 		t.Fatalf("unexpected user limit error: %v", err)
 	}
-	if _, err := manager.bindInbound(identityFromContext(userContext("in-b", "user-b")), tupleB); err != nil {
+	if _, err := manager.bindInbound(identityFromContext(userContext("in-b", "user-b")), tupleB, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.acquire(userContext("in-b", "user-b"), xnet.TCPDestination(xnet.DomainAddress("example.com"), 443)); err == nil {
@@ -573,6 +573,106 @@ func TestBlockedIdentitiesConfigValidation(t *testing.T) {
 	manager.Reset()
 	if len(manager.blockedIdentities) != 0 || len(manager.Snapshots()) != 0 {
 		t.Fatal("reset retained blocked identities")
+	}
+}
+
+func TestNewlyBlockedIdentityClosesOwnedInboundConnections(t *testing.T) {
+	for _, user := range []string{"user-a", ""} {
+		t.Run("user="+user, func(t *testing.T) {
+			manager := NewManager()
+			previous := Default
+			Default = manager
+			t.Cleanup(func() { Default = previous })
+			identity := Identity{InboundTag: "in-a", User: user}
+			owners := []Identity{identity, identity, {InboundTag: "in-a", User: "user-b"}, {InboundTag: "in-b", User: user}}
+			var conns []*addressedConn
+			for index, owner := range owners {
+				conn := newAddressedConn("127.0.0.1", 12345, "127.0.0.1", 45000+index)
+				tracked := TrackInbound(conn)
+				defer tracked.Close()
+				if err := BindInbound(userContext(owner.InboundTag, owner.User), tracked); err != nil {
+					t.Fatal(err)
+				}
+				conns = append(conns, conn)
+			}
+			if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{identity, identity}}); err == nil {
+				t.Fatal("duplicate blocked identity accepted")
+			}
+			for _, conn := range conns {
+				if conn.closed {
+					t.Fatal("invalid config closed an existing connection")
+				}
+			}
+			for i := 0; i < 2; i++ {
+				if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{identity}}); err != nil {
+					t.Fatal(err)
+				}
+				for index, conn := range conns {
+					if conn.closed != (index < 2) {
+						t.Fatalf("connection %d closed = %v", index, conn.closed)
+					}
+				}
+				if len(manager.inboundConns) != 2 || manager.globalCurrent != 2 {
+					t.Fatalf("closing retained ownership or leaked counters: owners=%d current=%d", len(manager.inboundConns), manager.globalCurrent)
+				}
+				if got := findSnapshot(t, manager, identity); !got.Blocked || got.InboundActive != 0 || got.RejectedBlocked != 0 {
+					t.Fatalf("existing-session close counted as admission rejection: %#v", got)
+				}
+			}
+			if err := manager.ReplaceConfig(Config{}); err != nil {
+				t.Fatal(err)
+			}
+			for index, conn := range conns {
+				if conn.closed != (index < 2) {
+					t.Fatalf("unblocking changed connection %d", index)
+				}
+			}
+		})
+	}
+}
+
+func TestBlockingConcurrentInboundBindAndClose(t *testing.T) {
+	manager := NewManager()
+	previous := Default
+	Default = manager
+	t.Cleanup(func() { Default = previous })
+	identity := Identity{InboundTag: "in-a", User: "user-a"}
+	for i := 0; i < 40; i++ {
+		if err := manager.ReplaceConfig(Config{}); err != nil {
+			t.Fatal(err)
+		}
+		local, peer := stdnet.Pipe()
+		conn := TrackInbound(local)
+		ready := make(chan struct{})
+		bound := make(chan error, 1)
+		go func() {
+			<-ready
+			bound <- BindInbound(userContext(identity.InboundTag, identity.User), conn)
+		}()
+		close(ready)
+		var bindErr error
+		if i%2 == 0 {
+			bindErr = <-bound
+		}
+		if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{identity}}); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 != 0 {
+			bindErr = <-bound
+		}
+		if bindErr != nil {
+			requireLimitReason(t, bindErr, BlockedIdentity)
+		} else {
+			_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+			if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+				t.Fatalf("connection admitted during blocking was not closed: %v", err)
+			}
+		}
+		_ = conn.Close()
+		_ = peer.Close()
+		if len(manager.inboundConns) != 0 || manager.globalCurrent != 0 {
+			t.Fatalf("concurrent bind/block leaked ownership: owners=%d current=%d", len(manager.inboundConns), manager.globalCurrent)
+		}
 	}
 }
 
@@ -993,7 +1093,7 @@ func TestManagementAndPortCombinedLimitsIncludeInboundAndOutbound(t *testing.T) 
 				t.Fatal(err)
 			}
 			tuple := socketTuple{LocalIP: netip.MustParseAddr("10.0.0.1"), LocalPort: 10001, RemoteIP: netip.MustParseAddr("198.51.100.1"), RemotePort: 41001}
-			socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple)
+			socketID, err := manager.bindInbound(Snapshot{Identity: identity, Attributed: true}, tuple, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1007,7 +1107,7 @@ func TestManagementAndPortCombinedLimitsIncludeInboundAndOutbound(t *testing.T) 
 				t.Fatalf("combined rejection = %v, want %s", err, test.want)
 			}
 			first.failed()
-			manager.releaseInbound(identity, socketID, "")
+			manager.releaseInbound(identity, socketID, "", nil)
 		})
 	}
 }
