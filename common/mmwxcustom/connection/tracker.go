@@ -64,6 +64,7 @@ type Config struct {
 	MaxGlobalTotalConnections      *int64                   `json:"max_global_total_connections"`
 	MaxGlobalInboundConnections    *int64                   `json:"max_global_inbound_connections"`
 	Limits                         []Limit                  `json:"limits"`
+	BlockedIdentities              []Identity               `json:"blocked_identities"`
 	PortLimits                     []PortLimit              `json:"port_limits"`
 	ManagementMappings             []ManagementGroupMapping `json:"management_mappings"`
 	ManagementLimits               []ManagementGroupLimit   `json:"management_limits"`
@@ -147,6 +148,8 @@ type Snapshot struct {
 	InboundPort                    uint32         `json:"inbound_port,omitempty"`
 	OutboundTag                    string         `json:"outbound_tag,omitempty"`
 	Attributed                     bool           `json:"attributed"`
+	Blocked                        bool           `json:"blocked"`
+	RejectedBlocked                uint64         `json:"rejected_blocked"`
 	InboundActive                  int64          `json:"inbound_active"`
 	InboundCurrent                 int64          `json:"inbound_current"`
 	InboundTotal                   uint64         `json:"inbound_total"`
@@ -190,6 +193,7 @@ type Snapshot struct {
 type LimitReason string
 
 const (
+	BlockedIdentity    LimitReason = "blocked"
 	ActiveLimit        LimitReason = "port_total_limit"
 	NewRateLimit       LimitReason = "port_new_rate_limit"
 	UserTotalLimit     LimitReason = "user_total_limit"
@@ -287,6 +291,7 @@ const socketTombstoneRetention = 2 * time.Minute
 type Manager struct {
 	mu                    sync.Mutex
 	limits                map[Identity]Limit
+	blockedIdentities     map[Identity]struct{}
 	states                map[Identity]*state
 	inbounds              map[string]ConfiguredInbound
 	defaultCW             *int64
@@ -313,6 +318,7 @@ var Default = NewManager()
 func NewManager() *Manager {
 	return &Manager{
 		limits:             make(map[Identity]Limit),
+		blockedIdentities:  make(map[Identity]struct{}),
 		states:             make(map[Identity]*state),
 		inbounds:           make(map[string]ConfiguredInbound),
 		managementMappings: make(map[Identity]string),
@@ -342,6 +348,7 @@ func Reset() {
 func (m *Manager) Reset() {
 	m.mu.Lock()
 	m.limits = make(map[Identity]Limit)
+	m.blockedIdentities = make(map[Identity]struct{})
 	m.states = make(map[Identity]*state)
 	m.inbounds = make(map[string]ConfiguredInbound)
 	m.defaultCW = nil
@@ -446,6 +453,16 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	if err := validateOptionalNonNegative("max_global_inbound_connections", config.MaxGlobalInboundConnections); err != nil {
 		return err
 	}
+	blocked := make(map[Identity]struct{}, len(config.BlockedIdentities))
+	for _, identity := range config.BlockedIdentities {
+		if identity.InboundTag == "" {
+			return fmt.Errorf("blocked identity requires inbound_tag")
+		}
+		if _, exists := blocked[identity]; exists {
+			return fmt.Errorf("duplicate blocked identity for inbound %q user %q", identity.InboundTag, identity.User)
+		}
+		blocked[identity] = struct{}{}
+	}
 	replacement := make(map[Identity]Limit, len(config.Limits))
 	for _, limit := range config.Limits {
 		if limit.Identity.InboundTag == "" {
@@ -521,6 +538,7 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	}
 	m.mu.Lock()
 	m.limits = replacement
+	m.blockedIdentities = blocked
 	m.managementMappings = mappings
 	m.managementLimits = groupLimits
 	m.portLimits = portLimits
@@ -534,6 +552,10 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	for identity, item := range m.states {
 		m.applyLimitLocked(&item.snapshot, replacement[identity])
 		item.snapshot.ManagementGroup = mappings[identity]
+	}
+	for identity := range blocked {
+		item := m.stateLocked(identity, Snapshot{Identity: identity, Attributed: true})
+		m.applyLimitLocked(&item.snapshot, replacement[identity])
 	}
 	for identity, group := range mappings {
 		metadata := Snapshot{Identity: identity, Attributed: true, ManagementGroup: group}
@@ -626,6 +648,7 @@ func clonePortLimit(limit PortLimit) PortLimit {
 }
 
 func (m *Manager) applyLimitLocked(snapshot *Snapshot, limit Limit) {
+	_, snapshot.Blocked = m.blockedIdentities[snapshot.Identity]
 	// Legacy identity-scoped limit fields are intentionally ignored. Identity is
 	// retained for attribution while administrator controls live at group/port.
 	snapshot.MaxInboundOnlineIPs = nil
@@ -789,6 +812,10 @@ func (m *Manager) effectiveIdentityLocked(snapshot Snapshot) Snapshot {
 		snapshot.Attributed = true
 		return snapshot
 	}
+	if _, blocked := m.blockedIdentities[snapshot.Identity]; blocked {
+		snapshot.Attributed = true
+		return snapshot
+	}
 	snapshot.Identity = Identity{}
 	snapshot.Attributed = false
 	return snapshot
@@ -796,6 +823,8 @@ func (m *Manager) effectiveIdentityLocked(snapshot Snapshot) Snapshot {
 
 func (m *Manager) rejectLocked(item *state, identity Identity, group string, reason LimitReason, limit int64) error {
 	switch reason {
+	case BlockedIdentity:
+		item.snapshot.RejectedBlocked++
 	case UserTotalLimit:
 		item.snapshot.RejectedUserTotalLimit++
 		m.groupStateLocked(group).rejectedUserTotalLimit++
@@ -933,6 +962,9 @@ func (m *Manager) admitInbound(identity Snapshot, source string) (*inboundLease,
 	group := m.managementMappings[key]
 	port := key.InboundTag
 	item.snapshot.ManagementGroup = group
+	if item.snapshot.Blocked {
+		return nil, m.rejectLocked(item, key, group, BlockedIdentity, 0)
+	}
 	groupLimit := m.managementLimits[group]
 	portLimit := m.portLimits[port]
 	groupState := m.groupStateLocked(group)
@@ -1169,6 +1201,9 @@ func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple) (uint64, err
 	m.applyLimitLocked(&item.snapshot, m.limits[key])
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
+	if item.snapshot.Blocked {
+		return 0, m.rejectLocked(item, key, group, BlockedIdentity, 0)
+	}
 	if m.globalLimit != nil && m.coreCurrentLocked() >= *m.globalLimit {
 		return 0, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
 	}

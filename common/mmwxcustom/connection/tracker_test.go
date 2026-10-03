@@ -490,6 +490,92 @@ func requireLimitReason(t *testing.T, err error, reason LimitReason) {
 	}
 }
 
+func TestBlockedIdentityAdmissionAndUnblocking(t *testing.T) {
+	for _, user := range []string{"user-a", ""} {
+		t.Run("user="+user, func(t *testing.T) {
+			manager := NewManager()
+			previous := Default
+			Default = manager
+			t.Cleanup(func() { Default = previous })
+			identity := Identity{InboundTag: "in-a", User: user}
+			if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{identity}}); err != nil {
+				t.Fatal(err)
+			}
+			if got := findSnapshot(t, manager, identity); !got.Blocked || !got.Attributed || got.RejectedBlocked != 0 {
+				t.Fatalf("blocked identity missing before traffic: %#v", got)
+			}
+			ctx := userContext(identity.InboundTag, identity.User)
+			conn := TrackInbound(newAddressedConn("127.0.0.1", 12345, "127.0.0.1", 45000))
+			defer conn.Close()
+			requireLimitReason(t, BindInbound(ctx, conn), BlockedIdentity)
+			requireLimitReason(t, BindInbound(ctx, conn), BlockedIdentity)
+			requireLimitReason(t, AdmitInbound(ctx), BlockedIdentity)
+			if got := findSnapshot(t, manager, identity); got.RejectedBlocked != 2 || got.InboundActive != 0 || got.InboundCurrent != 0 || got.OutboundRejectedTotal != 0 {
+				t.Fatalf("blocked admission counters = %#v", got)
+			}
+			for _, other := range []Identity{{InboundTag: "in-a", User: "user-b"}, {InboundTag: "in-b", User: user}} {
+				otherCtx, cancel := context.WithCancel(userContext(other.InboundTag, other.User))
+				defer cancel()
+				otherConn := TrackInbound(newAddressedConn("127.0.0.1", 12345, "127.0.0.1", 45001))
+				defer otherConn.Close()
+				if err := BindInbound(otherCtx, otherConn); err != nil {
+					t.Fatalf("unrelated identity rejected at bind: %v", err)
+				}
+				if err := AdmitInbound(otherCtx); err != nil {
+					t.Fatalf("unrelated identity rejected at admission: %v", err)
+				}
+			}
+			if err := manager.ReplaceConfig(Config{}); err != nil {
+				t.Fatal(err)
+			}
+			newCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			newConn := TrackInbound(newAddressedConn("127.0.0.1", 12345, "127.0.0.1", 45002))
+			defer newConn.Close()
+			if err := BindInbound(newCtx, newConn); err != nil {
+				t.Fatalf("unblocked identity rejected at bind: %v", err)
+			}
+			if err := AdmitInbound(newCtx); err != nil {
+				t.Fatalf("unblocked identity rejected at admission: %v", err)
+			}
+			if got := findSnapshot(t, manager, identity); got.Blocked || got.RejectedBlocked != 2 {
+				t.Fatalf("unblocking lost rejection history or retained block: %#v", got)
+			}
+		})
+	}
+}
+
+func TestBlockedIdentitiesConfigValidation(t *testing.T) {
+	identity := Identity{InboundTag: "in-a", User: "user-a"}
+	for _, config := range []Config{
+		{BlockedIdentities: []Identity{{User: "user-a"}}},
+		{BlockedIdentities: []Identity{identity, identity}},
+		{BlockedIdentities: []Identity{{InboundTag: "single"}, {InboundTag: "single"}}},
+		{BlockedIdentities: []Identity{{InboundTag: "in-b"}}, PortLimits: []PortLimit{{}}},
+	} {
+		manager := NewManager()
+		if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{identity}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.ReplaceConfig(config); err == nil {
+			t.Fatalf("accepted invalid config: %#v", config)
+		}
+		if len(manager.blockedIdentities) != 1 || !findSnapshot(t, manager, identity).Blocked {
+			t.Fatal("invalid config changed blocked identities")
+		}
+	}
+	manager := NewManager()
+	if err := manager.ReplaceConfig(Config{BlockedIdentities: []Identity{
+		identity, {InboundTag: "in-a", User: "user-b"}, {InboundTag: "in-b", User: "user-a"}, {InboundTag: "single"},
+	}}); err != nil {
+		t.Fatalf("distinct identities or empty user rejected: %v", err)
+	}
+	manager.Reset()
+	if len(manager.blockedIdentities) != 0 || len(manager.Snapshots()) != 0 {
+		t.Fatal("reset retained blocked identities")
+	}
+}
+
 func TestInboundGlobalUserPortPrecedenceAndCrossPortAggregation(t *testing.T) {
 	identityA := Identity{InboundTag: "in-a", User: "proto-a"}
 	identityB := Identity{InboundTag: "in-b", User: "proto-b"}
