@@ -25,9 +25,17 @@ import (
 // 任何人都能自称来自任意 IP —— IP 上限、封禁、风控就全都可以绕过。
 // 所以「信任」必须以来源是本机为前提,而这个前提由内核保证,伪造不了。
 
+// trusted_proxy_protocol_sources 是同一个宽容模式,只是「可信」从本机扩展到一组指定来源:
+// 转发链出口的前一跳是链上自己的服务器(公网地址),由它们在连接开头补 PROXY 头带来客户端真实 IP。
+// 列表里的来源有头就用、没头放行;列表外的来源头被读掉并忽略 —— 与上面同一条安全要害。
+
 // proxyProtocolPolicyFor 返回该 socket 配置对应的策略函数;enabled=false 表示压根不用包装。
 func proxyProtocolPolicyFor(sockopt *SocketConfig) (func(net.Addr) (proxyproto.Policy, error), bool) {
-	if sockopt == nil || (!sockopt.AcceptProxyProtocol && !sockopt.TrustLoopbackProxyProtocol) {
+	if sockopt == nil {
+		return nil, false
+	}
+	trusted := parseTrustedSources(sockopt.TrustedProxyProtocolSources)
+	if !sockopt.AcceptProxyProtocol && !sockopt.TrustLoopbackProxyProtocol && len(trusted) == 0 {
 		return nil, false
 	}
 	// 显式配了 accept_proxy_protocol 就按它的老语义来(REQUIRE),
@@ -35,12 +43,49 @@ func proxyProtocolPolicyFor(sockopt *SocketConfig) (func(net.Addr) (proxyproto.P
 	if sockopt.AcceptProxyProtocol {
 		return func(net.Addr) (proxyproto.Policy, error) { return proxyproto.REQUIRE, nil }, true
 	}
+	loopback := sockopt.TrustLoopbackProxyProtocol
 	return func(upstream net.Addr) (proxyproto.Policy, error) {
-		if isLoopbackAddr(upstream) {
+		if loopback && isLoopbackAddr(upstream) {
 			return proxyproto.USE, nil
+		}
+		if a, ok := tcpAddrIP(upstream); ok {
+			for _, p := range trusted {
+				if p.Contains(a) {
+					return proxyproto.USE, nil
+				}
+			}
 		}
 		return proxyproto.IGNORE, nil
 	}, true
+}
+
+// parseTrustedSources 把「IP 或 CIDR」列表解析成前缀;写错的项直接跳过(只会少信任,不会多信任)。
+func parseTrustedSources(list []string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range list {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(s); err == nil {
+			a = a.Unmap()
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+		}
+	}
+	return out
+}
+
+// tcpAddrIP 取连接来源的 IP(IPv4-mapped 的 v6 地址还原成 v4,与列表里写的 v4 地址能对上)。
+func tcpAddrIP(addr net.Addr) (netip.Addr, bool) {
+	tcp, ok := addr.(*net.TCPAddr)
+	if !ok || tcp == nil || tcp.IP == nil {
+		return netip.Addr{}, false
+	}
+	a, ok := netip.AddrFromSlice(tcp.IP)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	return a.Unmap(), true
 }
 
 // isLoopbackAddr 这个来源是不是本机。拿不到 IP(nil、unix socket 等)一律当**不是** ——

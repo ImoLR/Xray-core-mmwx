@@ -141,6 +141,14 @@ message SocketConfig {
   // 外部来的连接一律忽略其 PROXY 头(防止有人伪造源 IP)。
   bool trust_loopback_proxy_protocol = 24;
 
+  // trusted_proxy_protocol_sources 宽容模式的另一种:来源 IP 在这个列表里(单个 IP 或 CIDR)
+  // 的连接,有 PROXY 头就用、没头也放行;其余来源的 PROXY 头读掉并忽略。
+  //
+  // 给转发链出口用:前一跳是链上自己的服务器(公网地址,不是本机),它们在连接开头补一个
+  // PROXY 头把客户端真实 IP 带过来。只信任列表里的来源,别人伪造的头不生效;头是可选的,
+  // 没升级、不发头的前一跳和直连的客户端都不受影响。可与 trust_loopback_proxy_protocol 同时用。
+  repeated string trusted_proxy_protocol_sources = 25;
+
   DomainStrategy domain_strategy = 8;
 
   string dialer_proxy = 9;

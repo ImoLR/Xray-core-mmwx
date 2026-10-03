@@ -145,3 +145,92 @@ func TestTolerantModeAcceptsBothHeaderedAndPlain(t *testing.T) {
 	}
 	c2.Close()
 }
+
+// 转发链出口:前一跳是链上自己的服务器(公网地址)。只有列表里的来源的 PROXY 头生效,头可有可无;
+// 列表外的来源发来的头被读掉忽略(伪造不了源 IP),连接照常。
+func TestTrustedSourcesPolicy(t *testing.T) {
+	fn, enabled := proxyProtocolPolicyFor(&SocketConfig{
+		TrustedProxyProtocolSources: []string{"203.0.113.7", "198.51.100.0/24", "2001:db8::1", "坏的值"},
+	})
+	if !enabled {
+		t.Fatal("配了可信来源应启用")
+	}
+	cases := []struct {
+		addr string
+		want proxyproto.Policy
+	}{
+		{"203.0.113.7", proxyproto.USE},
+		{"::ffff:203.0.113.7", proxyproto.USE}, // 双栈 socket 上的 v4 来源
+		{"198.51.100.42", proxyproto.USE},
+		{"2001:db8::1", proxyproto.USE},
+		{"203.0.113.8", proxyproto.IGNORE},
+		{"127.0.0.1", proxyproto.IGNORE}, // 没开 trustLoopback 时本机也不信
+	}
+	for _, c := range cases {
+		if got, _ := fn(tcpAddr(c.addr)); got != c.want {
+			t.Errorf("%s: policy = %v, 期望 %v", c.addr, got, c.want)
+		}
+	}
+	if got, _ := fn(nil); got != proxyproto.IGNORE {
+		t.Errorf("拿不到来源时应忽略头,得到 %v", got)
+	}
+	// 与 trustLoopback 同时开:本机也信。
+	fn, _ = proxyProtocolPolicyFor(&SocketConfig{TrustLoopbackProxyProtocol: true, TrustedProxyProtocolSources: []string{"203.0.113.7"}})
+	if got, _ := fn(tcpAddr("127.0.0.1")); got != proxyproto.USE {
+		t.Errorf("同时开 trustLoopback 时本机应 USE,得到 %v", got)
+	}
+}
+
+// 真实 listener:可信来源带头 → 拿到头里的地址;不可信来源带头 → 头被吃掉、地址是真实来源;不带头 → 照常。
+func TestTrustedSourcesListener(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		trusted string
+		header  bool
+		want    string
+	}{
+		{"可信来源带头", "127.0.0.1", true, "192.0.2.55"},
+		{"可信来源不带头", "127.0.0.1", false, "127.0.0.1"},
+		{"不可信来源带头", "10.9.9.9", true, "127.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fn, _ := proxyProtocolPolicyFor(&SocketConfig{TrustedProxyProtocolSources: []string{tc.trusted}})
+			base, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			l := &proxyproto.Listener{Listener: base, Policy: fn}
+			defer l.Close()
+			type res struct{ remote, payload string }
+			got := make(chan res, 1)
+			go func() {
+				c, err := l.Accept()
+				if err != nil {
+					got <- res{remote: "accept error: " + err.Error()}
+					return
+				}
+				defer c.Close()
+				buf := make([]byte, 5)
+				n, _ := c.Read(buf)
+				host, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+				got <- res{host, string(buf[:n])}
+			}()
+			c, err := net.Dial("tcp", base.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if tc.header {
+				h := proxyproto.HeaderProxyFromAddrs(2, &net.TCPAddr{IP: net.ParseIP("192.0.2.55"), Port: 4444}, base.Addr())
+				if _, err := h.WriteTo(c); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, _ = c.Write([]byte("hello"))
+			r := <-got
+			if r.remote != tc.want || r.payload != "hello" {
+				t.Fatalf("remote=%q payload=%q,期望 remote=%q payload=hello", r.remote, r.payload, tc.want)
+			}
+		})
+	}
+}
