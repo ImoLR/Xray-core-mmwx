@@ -44,8 +44,80 @@ func TestControlServerSnapshotAndConfig(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil)
 	response = httptest.NewRecorder()
 	server.Handler.ServeHTTP(response, request)
-	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":6`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
-		t.Fatalf("v6 snapshot/global fields missing: %s", response.Body.String())
+	if !bytes.Contains(response.Body.Bytes(), []byte(`"version":7`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"max_total":30`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"inbound_port":10015`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"user":"user-a"`)) || !bytes.Contains(response.Body.Bytes(), []byte(`"group":"ken"`)) {
+		t.Fatalf("v7 snapshot/global fields missing: %s", response.Body.String())
+	}
+}
+
+func TestControlServerBlockedIdentitiesAndV6Config(t *testing.T) {
+	manager := NewManager()
+	manager.RegisterConfiguredInbound(ConfiguredInbound{Tag: "in-a", Port: 10015, Users: []string{"user-a", "user-b"}})
+	server := newControlServer(manager)
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte(`"version":7`)) {
+		t.Fatalf("v7 health response = %d %s", response.Code, response.Body.String())
+	}
+	identity := Identity{InboundTag: "in-a", User: "user-a"}
+	for _, test := range []struct {
+		name, body string
+		blocked    bool
+	}{
+		{name: "v7 block", body: `{"blocked_identities":[{"inbound_tag":"in-a","user":"user-a"},{"inbound_tag":"single","user":""}]}`, blocked: true},
+		{name: "v6 config clears block", body: `{"limits":[{"identity":{"inbound_tag":"in-a","user":"user-a"}}],"port_limits":[],"management_mappings":[],"management_limits":[]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/config", bytes.NewBufferString(test.body)))
+			if response.Code != http.StatusOK {
+				t.Fatalf("config status = %d body=%s", response.Code, response.Body.String())
+			}
+			lease, err := manager.admitInbound(Snapshot{Identity: identity, Attributed: true}, "")
+			if test.blocked {
+				requireLimitReason(t, err, BlockedIdentity)
+			} else if err != nil {
+				t.Fatalf("v6-shaped config retained block: %v", err)
+			}
+			lease.release()
+			response = httptest.NewRecorder()
+			server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil))
+			var report struct {
+				Version int `json:"version"`
+				Users   []struct {
+					Identity        Identity `json:"identity"`
+					Blocked         *bool    `json:"blocked"`
+					RejectedBlocked *uint64  `json:"rejected_blocked"`
+				} `json:"proxy_users"`
+			}
+			if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &report) != nil || report.Version != 7 || len(report.Users) != 3 {
+				t.Fatalf("v7 snapshot = %d %s", response.Code, response.Body.String())
+			}
+			for _, user := range report.Users {
+				wantBlocked := test.blocked && user.Identity.User != "user-b"
+				var wantRejected uint64
+				if user.Identity == identity {
+					wantRejected = 1
+				}
+				if user.Blocked == nil || *user.Blocked != wantBlocked || user.RejectedBlocked == nil || *user.RejectedBlocked != wantRejected {
+					t.Fatalf("blocked snapshot fields missing or incorrect: %s", response.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestControlServerRejectsInvalidBlockedIdentities(t *testing.T) {
+	for _, body := range []string{
+		`{"blocked_identities":[{"user":"user-a"}]}`,
+		`{"blocked_identities":[{"inbound_tag":"in-a","user":"user-a"},{"inbound_tag":"in-a","user":"user-a"}]}`,
+		`{"blocked_identities":[{"inbound_tag":"in-a","user":"","unknown":true}]}`,
+	} {
+		server := newControlServer(NewManager())
+		response := httptest.NewRecorder()
+		server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/v1/config", bytes.NewBufferString(body)))
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("config %s status = %d, want 400", body, response.Code)
+		}
 	}
 }
 
