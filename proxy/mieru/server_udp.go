@@ -30,11 +30,7 @@ func (s *Server) resolveUDPUser(firstPkt []byte) (*protocol.MemoryUser, cipher.A
 	tryUser := func(u *protocol.MemoryUser) cipher.AEAD {
 		acc := u.Account.(*MemoryAccount)
 		for _, r := range salts {
-			key, kerr := deriveKey(acc.hashedPassword, timeSalt(r))
-			if kerr != nil {
-				continue
-			}
-			aead, aerr := newAEAD(key)
+			aead, aerr := cachedAEAD(acc.hashedPassword, r)
 			if aerr != nil {
 				continue
 			}
@@ -111,13 +107,24 @@ func (s *Server) processUDP(ctx context.Context, conn stat.Connection, dispatche
 		}
 	}()
 
+	hashedPassword := user.Account.(*MemoryAccount).hashedPassword
 	handle := func(pkt []byte) {
 		seg, derr := decodeUDPSegment(pkt, aead)
 		if derr != nil {
-			return // 丢弃坏包
+			// UDP 底层连接可以活很久,timeSalt 每 2 分钟换一档:客户端换了档,后面的包用当前
+			// AEAD 就解不开了。只在解不开时试一下其余两档,能解就换过去;真是坏包照旧丢掉。
+			next, nseg := retryUDPKey(pkt, hashedPassword, aead)
+			if next == nil {
+				return
+			}
+			aead, seg = next, nseg
 		}
 		mu.Lock()
 		us, seen := sessions[seg.sessionID]
+		if !seen && seg.protocolType == protoOpenSessionRequest && s.replayed(pkt[:nonceLen]) {
+			mu.Unlock()
+			return // 原样重放的开会话包:不再替它拨落地
+		}
 		if !seen && seg.protocolType == protoOpenSessionRequest {
 			us = newUDPServerSession(connCtx, seg.sessionID, user, username, aead, writePkt, base, dispatcher)
 			id, self := seg.sessionID, us
@@ -149,6 +156,20 @@ func (s *Server) processUDP(ctx context.Context, conn stat.Connection, dispatche
 			handle(p)
 		}
 	}
+}
+
+// retryUDPKey 用当前 ±2 分钟的三个 timeSalt 重新试解,跳过已经失败的那个 AEAD。
+func retryUDPKey(pkt, hashedPassword []byte, failed cipher.AEAD) (cipher.AEAD, *segment) {
+	for _, r := range candidateRoundedTimes(time.Now().Unix()) {
+		a, err := cachedAEAD(hashedPassword, r)
+		if err != nil || a == failed {
+			continue
+		}
+		if seg, derr := decodeUDPSegment(pkt, a); derr == nil {
+			return a, seg
+		}
+	}
+	return nil, nil
 }
 
 // splitPackets 把一次 ReadMultiBuffer 的每个 buffer 取成独立字节切片(每 buffer=一个 UDP 包)。
@@ -270,7 +291,15 @@ func (us *udpServerSession) handleOpen(payload []byte) (opened, needMore bool) {
 	if perr != nil {
 		return false, perr == errSocks5Incomplete
 	}
-	if cmd != socks5CmdConnect {
+	switch cmd {
+	case socks5CmdConnect, socks5CmdUDPAssociate:
+	default:
+		// BIND 等:回 socks5「命令不支持」再由调用方关会话(返回 false → shutdown 发 closeSession)。
+		if !us.openResponded {
+			_ = us.sendSession(protoOpenSessionResponse)
+			us.openResponded = true
+		}
+		_ = us.sendData(socks5ReplyCommandNotSupported)
 		return false, false
 	}
 	ib := session.Inbound{}
@@ -281,11 +310,15 @@ func (us *udpServerSession) handleOpen(payload []byte) (opened, needMore bool) {
 	ib.Name = "mieru"
 	ib.CanSpliceCopy = 3
 	sctx := session.ContextWithInbound(us.ctx, &ib)
-	link, derr := us.dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
-	if derr != nil {
-		return false, false
+	if cmd == socks5CmdUDPAssociate {
+		us.link = newUDPAssociateLink(sctx, us.dispatcher)
+	} else {
+		link, derr := us.dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
+		if derr != nil {
+			return false, false
+		}
+		us.link = link
 	}
-	us.link = link
 
 	if !us.openResponded {
 		if err := us.sendSession(protoOpenSessionResponse); err != nil {

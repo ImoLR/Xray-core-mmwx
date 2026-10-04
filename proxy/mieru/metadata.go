@@ -1,8 +1,9 @@
 // metadata.go:mieru 段元数据(定长 32 字节)编解码。依据 docs/protocol.md「Metadata Format」。
-// 两类(低熵扩展 10/11 暂不实现):
+// 三类:
 //
 //	Session(2..5):| type | _ | timestamp(4) | sessionID(4) | seq(4) | status(1) | payloadLen(2) | suffixLen(1) | _(14) |
 //	Data   (6..9):| type | _ | timestamp(4) | sessionID(4) | seq(4) | unackSeq(4) | window(2) | frag(1) | prefixLen(1) | payloadLen(2) | suffixLen(1) | _(7) |
+//	低熵 (10/11):与 Data 相同,b[1]=低熵模式,末 7 字节 = 掩码(4) | 解码后载荷长度(2) | 掩码旋转(1)
 package mieru
 
 import (
@@ -23,7 +24,7 @@ const (
 	protoDataServerToClient   = 7
 	protoAckClientToServer    = 8
 	protoAckServerToClient    = 9
-	// 低熵扩展(暂不支持,但需识别以便优雅拒绝)
+	// 低熵扩展:载荷按 lowentropy.go 解码,其余语义同 6/7
 	protoDataClientToServerLowEntropy = 10
 	protoDataServerToClientLowEntropy = 11
 )
@@ -80,6 +81,12 @@ type dataMeta struct {
 	prefixLen    uint8 // padding 1 长度
 	payloadLen   uint16
 	suffixLen    uint8 // padding 2 长度
+
+	// 低熵扩展(仅 protocol type 10/11 有意义;6..9 时这些字节是 unused、恒为 0)
+	leMode      uint8
+	leMask      uint32
+	leExtracted uint16
+	leRotation  uint8
 }
 
 func (m dataMeta) encode() []byte {
@@ -114,7 +121,42 @@ func decodeDataMeta(b []byte) (dataMeta, error) {
 		prefixLen:    b[21],
 		payloadLen:   binary.BigEndian.Uint16(b[22:24]),
 		suffixLen:    b[24],
+		leMode:       b[1],
+		leMask:       binary.BigEndian.Uint32(b[25:29]),
+		leExtracted:  binary.BigEndian.Uint16(b[29:31]),
+		leRotation:   b[31],
 	}, nil
+}
+
+// isLowEntropyDataMeta 判断是不是低熵数据段(10/11)。
+func isLowEntropyDataMeta(t uint8) bool {
+	return t == protoDataClientToServerLowEntropy || t == protoDataServerToClientLowEntropy
+}
+
+// plainDataType 把低熵数据段映射回普通数据段类型:解码之后两者对会话层完全一样。
+func plainDataType(t uint8) uint8 {
+	switch t {
+	case protoDataClientToServerLowEntropy:
+		return protoDataClientToServer
+	case protoDataServerToClientLowEntropy:
+		return protoDataServerToClient
+	}
+	return t
+}
+
+// openPayload 解出段载荷。普通段:payload 就是 AEAD 密文 + tag;低熵段(模式非 0):
+// 前 payloadLen 字节是编码后的密文体,先还原成 leExtracted 字节的密文,再拼上原样的 tag 解密。
+func openPayload(open func(sealed []byte) ([]byte, error), wire []byte, m *dataMeta) ([]byte, error) {
+	if m == nil || !isLowEntropyDataMeta(m.protocolType) || m.leMode == 0 {
+		return open(wire)
+	}
+	body := wire[:len(wire)-aeadTagLen]
+	tag := wire[len(wire)-aeadTagLen:]
+	cipherBody, err := decodeLowEntropy(body, m.leMode, m.leMask, m.leRotation, int(m.leExtracted))
+	if err != nil {
+		return nil, err
+	}
+	return open(append(cipherBody, tag...))
 }
 
 // metaProtocolType 从已解密的 32 字节元数据里取 protocol type(用于分派 session/data 解码)。

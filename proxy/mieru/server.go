@@ -21,6 +21,7 @@ import (
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
@@ -33,6 +34,9 @@ type Server struct {
 	users  []*protocol.MemoryUser
 
 	policyManager policy.Manager
+
+	// replay 记认证通过的握手 nonce(TCP 首段 / UDP 开会话包),拒绝原样重放。
+	replay *replayFilter
 }
 
 // NewServer 从配置构建 mieru 入站。
@@ -40,6 +44,7 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
 	s := &Server{
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+		replay:        newReplayFilter(5 * time.Minute),
 	}
 	for _, u := range config.Users {
 		mu, err := u.ToMemoryUser()
@@ -77,11 +82,7 @@ func (s *Server) resolveUser(br *bufio.Reader) (*protocol.MemoryUser, cipher.AEA
 	tryUser := func(u *protocol.MemoryUser) (cipher.AEAD, bool) {
 		acc := u.Account.(*MemoryAccount)
 		for _, r := range salts {
-			key, kerr := deriveKey(acc.hashedPassword, timeSalt(r))
-			if kerr != nil {
-				continue
-			}
-			aead, aerr := newAEAD(key)
+			aead, aerr := cachedAEAD(acc.hashedPassword, r)
 			if aerr != nil {
 				continue
 			}
@@ -109,6 +110,11 @@ func (s *Server) resolveUser(br *bufio.Reader) (*protocol.MemoryUser, cipher.AEA
 	return nil, nil, nil, errors.New("mieru: no user matched handshake")
 }
 
+// replayed 报告握手 nonce 是否是重放(测试里直接构造的 Server 没有过滤器,视为不检查)。
+func (s *Server) replayed(nonce []byte) bool {
+	return s.replay != nil && s.replay.seen(nonce)
+}
+
 func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	if network == xnet.Network_UDP {
 		return s.processUDP(ctx, conn, dispatcher)
@@ -121,6 +127,9 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	user, aead, nonce, err := s.resolveUser(br)
 	if err != nil {
 		return errors.New("mieru: handshake").Base(err)
+	}
+	if s.replayed(nonce) {
+		return errors.New("mieru: replayed handshake rejected")
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 	username := user.Account.(*MemoryAccount).Username
@@ -278,8 +287,11 @@ func (s *Server) handleOpen(ctx context.Context, base *session.Inbound, user *pr
 	if perr != nil {
 		return false, perr == errSocks5Incomplete
 	}
-	if cmd != socks5CmdConnect {
-		// UDP-associate 等后续支持;此处仅优雅忽略(不建会话)。
+	switch cmd {
+	case socks5CmdConnect, socks5CmdUDPAssociate:
+	default:
+		// BIND 等:回 socks5「命令不支持」并关会话。以前静默忽略,客户端那条会话一直挂到超时。
+		rejectSocks5Command(writer, sessionID, clientSeq)
 		return false, false
 	}
 
@@ -293,10 +305,16 @@ func (s *Server) handleOpen(ctx context.Context, base *session.Inbound, user *pr
 	ib.CanSpliceCopy = 3
 	sctx, cancel := context.WithCancel(session.ContextWithInbound(ctx, &ib))
 
-	link, derr := dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
-	if derr != nil {
-		cancel()
-		return false, false
+	var link *transport.Link
+	if cmd == socks5CmdUDPAssociate {
+		link = newUDPAssociateLink(sctx, dispatcher)
+	} else {
+		var derr error
+		link, derr = dispatcher.Dispatch(accessLogCtx(sctx, dest), dest)
+		if derr != nil {
+			cancel()
+			return false, false
+		}
 	}
 
 	ss := &serverSession{id: sessionID, link: link, writer: writer, cancel: cancel}
@@ -325,6 +343,20 @@ func (s *Server) handleOpen(ctx context.Context, base *session.Inbound, user *pr
 	}
 	go ss.pump()
 	return true, false
+}
+
+// rejectSocks5Command 回 openSessionResponse + socks5 REP=7 + closeSessionRequest,不建会话。
+func rejectSocks5Command(writer *lockedWriter, sessionID, clientSeq uint32) {
+	_ = writer.write(sessionMeta{protocolType: protoOpenSessionResponse, sessionID: sessionID, seq: 0}.encode(), nil)
+	_ = writer.write(dataMeta{
+		protocolType: protoDataServerToClient,
+		sessionID:    sessionID,
+		seq:          1,
+		unackSeq:     clientSeq + 1,
+		window:       defaultWindow,
+		payloadLen:   uint16(len(socks5ReplyCommandNotSupported)),
+	}.encode(), socks5ReplyCommandNotSupported)
+	_ = writer.write(sessionMeta{protocolType: protoCloseSessionRequest, sessionID: sessionID, seq: 2}.encode(), nil)
 }
 
 func init() {

@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -138,6 +139,12 @@ func (m *mieruStream) Read(p []byte) (int, error) {
 
 // dialMieru 完整走一遍客户端流程,返回一条可收发的会话。
 func dialMieru(addr, username, password string) (*mieruStream, error) {
+	return dialMieruWith(addr, username, password, socks5ConnectRequest)
+}
+
+// dialMieruWith 同 dialMieru,但会话内发的是给定的 socks5 请求(CONNECT / UDP ASSOCIATE / BIND)。
+// socks5 回复非成功时返回 errSocks5Rejected,方便测试判断「被拒绝」与「出错」。
+func dialMieruWith(addr, username, password string, socks5Req []byte) (*mieruStream, error) {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -167,9 +174,9 @@ func dialMieru(addr, username, password string) (*mieruStream, error) {
 		protocolType: protoOpenSessionRequest,
 		sessionID:    1,
 		seq:          0,
-		payloadLen:   uint16(len(socks5ConnectRequest)),
+		payloadLen:   uint16(len(socks5Req)),
 	}.encode()
-	if err := sw.write(meta, socks5ConnectRequest); err != nil {
+	if err := sw.write(meta, socks5Req); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -197,7 +204,11 @@ func dialMieru(addr, username, password string) (*mieruStream, error) {
 		_ = conn.Close()
 		return nil, err
 	}
-	if seg.protocolType != protoDataServerToClient || len(seg.payload) < 2 || seg.payload[1] != 0x00 {
+	if seg.protocolType == protoDataServerToClient && len(seg.payload) >= 2 && seg.payload[1] != 0x00 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: REP=%d", errSocks5Rejected, seg.payload[1])
+	}
+	if seg.protocolType != protoDataServerToClient || len(seg.payload) < 2 {
 		_ = conn.Close()
 		return nil, fmt.Errorf("socks5 回复不对: type=%d payload=%v", seg.protocolType, seg.payload)
 	}
@@ -205,6 +216,8 @@ func dialMieru(addr, username, password string) (*mieruStream, error) {
 	_ = conn.SetDeadline(time.Time{})
 	return &mieruStream{conn: conn, sw: sw, sr: sr, sid: 1}, nil
 }
+
+var errSocks5Rejected = errors.New("socks5 rejected")
 
 // probeMieru 用某个凭据完整建一次会话并回显一帧。返回 nil 即「这个用户此刻真的能用」。
 func probeMieru(addr, username, password string) error {
