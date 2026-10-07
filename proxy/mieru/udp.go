@@ -28,15 +28,17 @@ func decodeUDPSegment(packet []byte, aead cipher.AEAD) (*segment, error) {
 	off += metadataLen + aeadTagLen
 
 	pt := metaProtocolType(meta)
-	seg := &segment{protocolType: pt}
+	seg := &segment{protocolType: plainDataType(pt)}
 	var prefixLen, payloadLen int
+	var dm *dataMeta
 	switch {
 	case isSessionMeta(pt):
 		m, _ := decodeSessionMeta(meta)
 		seg.sessionID, seg.seq, seg.statusCode = m.sessionID, m.seq, m.statusCode
 		payloadLen = int(m.payloadLen)
-	case isDataMeta(pt):
+	case isDataMeta(pt) || isLowEntropyDataMeta(pt):
 		m, _ := decodeDataMeta(meta)
+		dm = &m
 		seg.sessionID, seg.seq, seg.unackSeq, seg.window = m.sessionID, m.seq, m.unackSeq, m.window
 		prefixLen, payloadLen = int(m.prefixLen), int(m.payloadLen)
 	default:
@@ -49,7 +51,9 @@ func decodeUDPSegment(packet []byte, aead cipher.AEAD) (*segment, error) {
 			return nil, errors.New("mieru udp: payload out of range")
 		}
 		// UDP:payload 与 metadata 共用同一 nonce(不递增)。
-		pl, err := aead.Open(nil, nonce, packet[off:off+payloadLen+aeadTagLen], nil)
+		pl, err := openPayload(func(sealed []byte) ([]byte, error) {
+			return aead.Open(nil, nonce, sealed, nil)
+		}, packet[off:off+payloadLen+aeadTagLen], dm)
 		if err != nil {
 			return nil, errors.New("mieru udp: open payload failed").Base(err)
 		}
@@ -59,8 +63,8 @@ func decodeUDPSegment(packet []byte, aead cipher.AEAD) (*segment, error) {
 	return seg, nil
 }
 
-// encodeUDPSegment 把一个段封成一个 UDP 包(不加 padding)。每包生成新随机 nonce(末 4 字节带 userTag)。
-// metaBytes 的 payloadLen 须与 payload 一致、prefix/suffix=0。
+// encodeUDPSegment 把一个段封成一个 UDP 包,随机加 padding 1 / 2(addPadding)。每包生成新随机 nonce(末 4 字节带 userTag)。
+// metaBytes 的 payloadLen 须与 payload 一致,prefix/suffix 由这里填。
 func encodeUDPSegment(metaBytes, payload []byte, aead cipher.AEAD, username string) ([]byte, error) {
 	nonce := make([]byte, nonceLen)
 	if _, err := crand.Read(nonce); err != nil {
@@ -68,11 +72,13 @@ func encodeUDPSegment(metaBytes, payload []byte, aead cipher.AEAD, username stri
 	}
 	applyUserTag(nonce, username)
 
-	out := make([]byte, 0, nonceLen+metadataLen+aeadTagLen+len(payload)+aeadTagLen)
+	pad1, pad2 := addPadding(metaBytes)
+	out := make([]byte, 0, nonceLen+metadataLen+aeadTagLen+len(pad1)+len(payload)+aeadTagLen+len(pad2))
 	out = append(out, nonce...)
 	out = aead.Seal(out, nonce, metaBytes, nil)
+	out = append(out, pad1...)
 	if len(payload) > 0 {
 		out = aead.Seal(out, nonce, payload, nil) // 同 nonce
 	}
-	return out, nil
+	return append(out, pad2...), nil
 }
