@@ -1622,6 +1622,12 @@ func TrackInbound(conn stdnet.Conn) stdnet.Conn {
 	return &trackedInboundConn{Conn: conn, manager: Default, tuple: tuple}
 }
 
+// UnwrapInbound exposes the transport for protocol inspection and raw copy.
+// The session must retain and close the tracked connection to release ownership.
+func (c *trackedInboundConn) UnwrapInbound() stdnet.Conn {
+	return c.Conn
+}
+
 func BindInbound(ctx context.Context, conn stdnet.Conn) error {
 	tracked, ok := conn.(*trackedInboundConn)
 	if !ok || tracked == nil {

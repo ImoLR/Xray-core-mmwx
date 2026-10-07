@@ -693,6 +693,9 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 			readCounter = statConn.ReadCounter
 			writerCounter = statConn.WriteCounter
 		}
+		if trackedConn, ok := conn.(interface{ UnwrapInbound() net.Conn }); ok {
+			conn = trackedConn.UnwrapInbound()
+		}
 
 		if !isEncryption { // avoids double penetration
 			if xc, ok := conn.(*tls.Conn); ok {

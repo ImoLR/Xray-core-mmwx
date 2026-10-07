@@ -37,8 +37,11 @@ func TryUnwrapStatsConn(conn net.Conn) net.Conn {
 	if conn == nil {
 		return conn
 	}
-	if conn, ok := conn.(*CounterConnection); ok {
-		return conn.Connection
+	if counterConn, ok := conn.(*CounterConnection); ok {
+		conn = counterConn.Connection
+	}
+	if trackedConn, ok := conn.(interface{ UnwrapInbound() net.Conn }); ok {
+		return trackedConn.UnwrapInbound()
 	}
 	return conn
 }
