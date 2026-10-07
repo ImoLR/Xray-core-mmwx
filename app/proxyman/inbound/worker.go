@@ -104,7 +104,6 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	ctx = session.ContextWithOutbounds(ctx, outbounds)
 
 	conn = customconnection.TrackInbound(conn)
-	trackedConn := conn
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
 		conn = &stat.CounterConnection{
 			Connection:   conn,
@@ -117,7 +116,7 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 		Local:   net.DestinationFromAddr(conn.LocalAddr()),
 		Gateway: net.TCPDestination(w.address, w.port),
 		Tag:     w.tag,
-		Conn:    trackedConn,
+		Conn:    conn,
 	})
 
 	content := new(session.Content)

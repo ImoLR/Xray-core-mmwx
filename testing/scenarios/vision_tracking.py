@@ -230,7 +230,9 @@ def run_case(fixture, flow):
         if flow:
             wait_for(lambda: "XtlsFilterTls found tls 1.3!" in fixture.server_log.read_text())
             wait_for(lambda: "command 2" in fixture.server_log.read_text())
+            wait_for(lambda: "CopyRawConn splice" in fixture.server_log.read_text())
             result["tls13_direct_copy"] = True
+            result["tracked_freedom_splice"] = True
         live_stats = fixture.stats()
         for direction in ("uplink", "downlink"):
             assert live_stats.get(f"user>>>{IDENTITIES[0]['user']}>>>traffic>>>{direction}", 0) >= len(PAYLOAD), live_stats

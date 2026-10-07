@@ -16,6 +16,7 @@ import (
 
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type Identity struct {
@@ -1629,6 +1630,10 @@ func (c *trackedInboundConn) UnwrapInbound() stdnet.Conn {
 }
 
 func BindInbound(ctx context.Context, conn stdnet.Conn) error {
+	// Session.Conn retains the statistics wrapper so raw copy can account bytes.
+	if counter, ok := conn.(*stat.CounterConnection); ok {
+		conn = counter.Connection
+	}
 	tracked, ok := conn.(*trackedInboundConn)
 	if !ok || tracked == nil {
 		return nil
@@ -1705,10 +1710,22 @@ type trackedOutboundConn struct {
 	timer            *time.Timer
 }
 
+// UnwrapOutbound exposes the transport for raw copy. The owner must retain
+// and close this wrapper, and notify ObserveEOF when raw reads reach EOF.
+func (c *trackedOutboundConn) UnwrapOutbound() stdnet.Conn {
+	return c.Conn
+}
+
+func (c *trackedOutboundConn) ObserveEOF() {
+	if c.closeWaitTimeout > 0 {
+		c.armCloseWaitTimer()
+	}
+}
+
 func (c *trackedOutboundConn) Read(buffer []byte) (int, error) {
 	n, err := c.Conn.Read(buffer)
-	if err == io.EOF && c.closeWaitTimeout > 0 {
-		c.armCloseWaitTimer()
+	if err == io.EOF {
+		c.ObserveEOF()
 	}
 	return n, err
 }

@@ -277,13 +277,13 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.ob.CanSpliceCopy = 1
 			}
 		}
-		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
+		readerConn, readCounter, _, observeEOF := unwrapRawConn(w.conn)
 		// 给 mmw-agent 这类下游一次包装底层 conn 的机会(per-user 限速),
 		// 未注册 hook 时原样返回,无开销。详见 vision_limiter_hook.go。
 		// isUplink 的 Reader 读的是客户端连接(入站侧);!isUplink 的是出站侧读落地服务器。
 		readerConn = maybeWrapVisionConn(w.ctx, readerConn, w.isUplink)
 		w.directReadCounter = readCounter
-		w.Reader = buf.NewReader(readerConn)
+		w.Reader = newRawReader(readerConn, observeEOF)
 	}
 	return buffer, err
 }
@@ -678,7 +678,13 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
 func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
+	raw, readCounter, writeCounter, _ := unwrapRawConn(conn)
+	return raw, readCounter, writeCounter
+}
+
+func unwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter, func()) {
 	var readCounter, writerCounter stats.Counter
+	var observeEOF func()
 	if conn != nil {
 		isEncryption := false
 		if commonConn, ok := conn.(*encryption.CommonConn); ok {
@@ -686,7 +692,7 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 			isEncryption = true
 		}
 		if xorConn, ok := conn.(*encryption.XorConn); ok {
-			return xorConn, nil, nil // full-random xorConn should not be penetrated
+			return xorConn, nil, nil, nil // full-random xorConn should not be penetrated
 		}
 		if statConn, ok := conn.(*stat.CounterConnection); ok {
 			conn = statConn.Connection
@@ -695,6 +701,13 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 		}
 		if trackedConn, ok := conn.(interface{ UnwrapInbound() net.Conn }); ok {
 			conn = trackedConn.UnwrapInbound()
+		}
+		if trackedConn, ok := conn.(interface {
+			UnwrapOutbound() net.Conn
+			ObserveEOF()
+		}); ok {
+			observeEOF = trackedConn.ObserveEOF
+			conn = trackedConn.UnwrapOutbound()
 		}
 
 		if !isEncryption { // avoids double penetration
@@ -719,7 +732,28 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 			conn = uc.UnixConn
 		}
 	}
-	return conn, readCounter, writerCounter
+	return conn, readCounter, writerCounter, observeEOF
+}
+
+type eofReader struct {
+	buf.Reader
+	observeEOF func()
+}
+
+func (r *eofReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	buffer, err := r.Reader.ReadMultiBuffer()
+	if errors.Cause(err) == io.EOF {
+		r.observeEOF()
+	}
+	return buffer, err
+}
+
+func newRawReader(conn net.Conn, observeEOF func()) buf.Reader {
+	reader := buf.NewReader(conn)
+	if observeEOF != nil {
+		return &eofReader{Reader: reader, observeEOF: observeEOF}
+	}
+	return reader
 }
 
 // CopyRawConnIfExist use the most efficient copy method.
@@ -799,9 +833,9 @@ func spliceCopyAccounted(dst io.Writer, src io.Reader, account func(int64)) erro
 }
 
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
-	readerConn, readCounter, _ := UnwrapRawConn(readerConn)
+	readerConn, readCounter, _, observeEOF := unwrapRawConn(readerConn)
 	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
-	reader := buf.NewReader(readerConn)
+	reader := newRawReader(readerConn, observeEOF)
 	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
@@ -861,6 +895,9 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			if err != nil && errors.Cause(err) != io.EOF {
 				return err
 			}
+			if errors.Cause(err) == io.EOF && observeEOF != nil {
+				observeEOF()
+			}
 			return nil
 		}
 		buffer, err := reader.ReadMultiBuffer()
@@ -892,6 +929,9 @@ func readV(ctx context.Context, reader buf.Reader, writer buf.Writer, timer sign
 
 func IsRAWTransportWithoutSecurity(conn stat.Connection) bool {
 	iConn := stat.TryUnwrapStatsConn(conn)
+	if trackedConn, ok := iConn.(interface{ UnwrapOutbound() net.Conn }); ok {
+		iConn = trackedConn.UnwrapOutbound()
+	}
 	iConn = finalmask.UnwrapTcpMask(iConn)
 	_, ok1 := iConn.(*proxyproto.Conn)
 	_, ok2 := iConn.(*net.TCPConn)
