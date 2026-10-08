@@ -892,15 +892,29 @@ func spliceCopyAccounted(dst io.Writer, src io.Reader, account func(int64)) erro
 func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net.Conn, writer buf.Writer, timer *signal.ActivityTimer, inTimer *signal.ActivityTimer) error {
 	readerConn, readCounter, _, observeEOF := unwrapRawConn(readerConn)
 	writerConn, _, writeCounter := UnwrapRawConn(writerConn)
+	inbound := session.InboundFromContext(ctx)
+	limited := false
+	if visionLimiterHook != nil && inbound != nil && inbound.Conn != nil {
+		rawInbound, _, _ := UnwrapRawConn(inbound.Conn)
+		// Raw copying bypasses VisionReader/Writer. Keep their client-side
+		// limiter on the reader, and let the Vision writer handle limited writes.
+		if readerConn == rawInbound {
+			wrapped := maybeWrapVisionConn(ctx, readerConn, true)
+			limited = wrapped != readerConn
+			readerConn = wrapped
+		}
+		if writerConn == rawInbound {
+			limited = maybeWrapVisionConn(ctx, writerConn, true) != writerConn || limited
+		}
+	}
 	reader := newRawReader(readerConn, observeEOF)
-	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+	if limited || runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
 	tc, ok := writerConn.(*net.TCPConn)
 	if !ok || readerConn == nil || writerConn == nil {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
-	inbound := session.InboundFromContext(ctx)
 	if inbound == nil || inbound.CanSpliceCopy == 3 {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}

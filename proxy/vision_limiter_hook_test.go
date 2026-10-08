@@ -8,9 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/app/dispatcher"
+	appstats "github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/signal"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 // sinkConn 吞掉所有写入、读即 EOF,只用来给 Vision 读写器一个可替换的底层 conn。
@@ -135,5 +139,121 @@ func TestVisionReaderHookOnlyOnClientSide(t *testing.T) {
 				t.Fatalf("hook calls = %q, want wrapped=%v", *calls, tc.wantWrap)
 			}
 		})
+	}
+}
+
+type visionLimitedConn struct {
+	stdnet.Conn
+	bytes *appstats.Counter
+}
+
+func (c *visionLimitedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.bytes.Add(int64(n))
+	return n, err
+}
+
+func (c *visionLimitedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.bytes.Add(int64(n))
+	return n, err
+}
+
+func TestVisionRawCopyHonorsLimiter(t *testing.T) {
+	previous := visionLimiterHook
+	t.Cleanup(func() { visionLimiterHook = previous })
+	pair := func(t *testing.T) (*stdnet.TCPConn, *stdnet.TCPConn) {
+		t.Helper()
+		listener, err := stdnet.ListenTCP("tcp4", &stdnet.TCPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		peer, err := stdnet.DialTCP("tcp4", nil, listener.Addr().(*stdnet.TCPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { peer.Close() })
+		conn, err := listener.AcceptTCP()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		peer.SetDeadline(time.Now().Add(5 * time.Second))
+		return conn, peer
+	}
+	for _, limited := range []bool{false, true} {
+		for _, upload := range []bool{false, true} {
+			name := "download"
+			if upload {
+				name = "upload"
+			}
+			if limited {
+				name += "/limited"
+			} else {
+				name += "/unlimited"
+			}
+			t.Run(name, func(t *testing.T) {
+				throttled := new(appstats.Counter)
+				SetVisionLimiterHook(func(email string, conn stdnet.Conn) stdnet.Conn {
+					if limited && email == "alice" {
+						return &visionLimitedConn{Conn: conn, bytes: throttled}
+					}
+					return conn
+				})
+				reader, source := pair(t)
+				writer, destination := pair(t)
+				readCounter, writeCounter, userCounter := new(appstats.Counter), new(appstats.Counter), new(appstats.Counter)
+				readConn := &stat.CounterConnection{Connection: reader, ReadCounter: readCounter}
+				writeConn := &stat.CounterConnection{Connection: writer, WriteCounter: writeCounter}
+				ctx := ctxWithInboundUser("alice")
+				inbound := session.InboundFromContext(ctx)
+				inbound.Conn, inbound.CanSpliceCopy = writeConn, 1
+				ctx = session.ContextWithOutbounds(ctx, []*session.Outbound{{CanSpliceCopy: 1}})
+				var fallback buf.Writer = buf.NewWriter(writeConn)
+				if upload {
+					inbound.Conn = readConn
+				} else {
+					state := NewTrafficState(make([]byte, 16))
+					state.NumberOfPacketToFilter = 0
+					state.Inbound.IsPadding = false
+					state.Inbound.DownlinkWriterDirectCopy = true
+					fallback = NewVisionWriter(buf.Discard, state, false, ctx, writeConn, nil, nil)
+				}
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				timer := signal.CancelAfterInactivity(ctx, cancel, 5*time.Second)
+				defer timer.SetTimeout(0)
+				copied := make(chan error, 1)
+				go func() {
+					copied <- CopyRawConnIfExist(ctx, readConn, writeConn, &dispatcher.SizeStatWriter{Writer: fallback, Counter: userCounter}, timer, nil)
+				}()
+				payload := bytes.Repeat([]byte("limited Vision"), 4096)
+				written := make(chan error, 1)
+				go func() {
+					_, err := source.Write(payload)
+					source.CloseWrite()
+					written <- err
+				}()
+				received := make([]byte, len(payload))
+				if _, err := io.ReadFull(destination, received); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-written; err != nil {
+					t.Fatal(err)
+				}
+				if err := <-copied; err != nil {
+					t.Fatal(err)
+				}
+				want := int64(len(payload))
+				if !bytes.Equal(received, payload) || readCounter.Value() != want || writeCounter.Value() != want || userCounter.Value() != want {
+					t.Fatal("raw copy lost payload or accounting")
+				}
+				if limited && throttled.Value() != want || !limited && throttled.Value() != 0 {
+					t.Fatalf("limiter saw %d bytes, limited=%v, payload=%d", throttled.Value(), limited, want)
+				}
+			})
+		}
 	}
 }
