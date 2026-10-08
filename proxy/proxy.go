@@ -301,6 +301,9 @@ type VisionWriter struct {
 	// internal
 	writeOnceUserUUID  []byte
 	directWriteCounter stats.Counter
+	tlsRecordHeader    [5]byte
+	tlsRecordHeaderN   int
+	tlsRecordRemaining int
 
 	testseed []uint32
 }
@@ -327,6 +330,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	var isPadding *bool
 	var switchToDirectCopy *bool
 	var spliceReadyInbound *session.Inbound
+	var remaining buf.MultiBuffer
 	if w.isUplink {
 		isPadding = &w.trafficState.Outbound.IsPadding
 		switchToDirectCopy = &w.trafficState.Outbound.UplinkWriterDirectCopy
@@ -364,11 +368,20 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		if len(mb) == 1 && mb[0] == nil {
 			mb[0] = XtlsPadding(nil, CommandPaddingContinue, &w.writeOnceUserUUID, true, w.ctx, w.testseed) // we do a long padding to hide vless header
 		} else {
-			isComplete := IsCompleteRecord(mb)
+			end := w.tlsApplicationDataEnd(mb)
+			endPadding := w.trafficState.IsTLS && end > 0
+			if endPadding && end < mb.Len() {
+				remaining, mb = buf.SplitSize(mb, end)
+				if n := end - mb.Len(); n > 0 {
+					var tail buf.MultiBuffer
+					remaining, tail = buf.SplitSize(remaining, n)
+					mb = append(mb, tail...)
+				}
+			}
 			mb = ReshapeMultiBuffer(w.ctx, mb)
 			longPadding := w.trafficState.IsTLS
 			for i, b := range mb {
-				if w.trafficState.IsTLS && b.Len() >= 6 && bytes.Equal(TlsApplicationDataStart, b.BytesTo(3)) && isComplete {
+				if endPadding {
 					if w.trafficState.EnableXtls {
 						*switchToDirectCopy = true
 					}
@@ -400,7 +413,11 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		}
 	}
 	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
+		buf.ReleaseMulti(remaining)
 		return err
+	}
+	if !remaining.IsEmpty() {
+		return w.WriteMultiBuffer(remaining)
 	}
 	if spliceReadyInbound != nil && spliceReadyInbound.CanSpliceCopy == 2 {
 		// Enable splice only after this write has completed to avoid racing
@@ -408,6 +425,46 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		spliceReadyInbound.CanSpliceCopy = 1
 	}
 	return nil
+}
+
+// tlsApplicationDataEnd tracks record boundaries across TCP reads. A direct
+// command must end at a record boundary, even when this write also contains
+// part of the next record. Payload bytes are forwarded without buffering.
+func (w *VisionWriter) tlsApplicationDataEnd(mb buf.MultiBuffer) int32 {
+	if w.tlsRecordRemaining < 0 {
+		return 0
+	}
+	var offset int32
+	for _, b := range mb {
+		for data := b.Bytes(); len(data) > 0; {
+			if w.tlsRecordHeaderN < len(w.tlsRecordHeader) {
+				n := copy(w.tlsRecordHeader[w.tlsRecordHeaderN:], data)
+				w.tlsRecordHeaderN += n
+				offset += int32(n)
+				data = data[n:]
+				if w.tlsRecordHeaderN < len(w.tlsRecordHeader) {
+					continue
+				}
+				h := w.tlsRecordHeader
+				if h[0] < 20 || h[0] > 23 || h[1] != 3 || h[2] > 3 {
+					w.tlsRecordRemaining = -1
+					return 0
+				}
+				w.tlsRecordRemaining = int(h[3])<<8 | int(h[4])
+			}
+			n := min(w.tlsRecordRemaining, len(data))
+			w.tlsRecordRemaining -= n
+			offset += int32(n)
+			data = data[n:]
+			if w.tlsRecordRemaining == 0 {
+				w.tlsRecordHeaderN = 0
+				if w.tlsRecordHeader[0] == 23 {
+					return offset
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // IsCompleteRecord Is complete tls data record
