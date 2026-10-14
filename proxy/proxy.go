@@ -772,21 +772,26 @@ const (
 // 「长期为 0、偶尔一大坨」,正是要治的病。夹住之后,一次瞬时尖峰最多让段翻倍,
 // 几段之内就自我校正回稳态,记账间隔始终维持在半秒量级。
 func nextSpliceChunk(cur, n int64, took time.Duration) int64 {
+	return proportionalChunk(cur, n, took, spliceAccountTarget, spliceAccountChunkMin, spliceAccountChunk)
+}
+
+// proportionalChunk 是 nextSpliceChunk 的通用版:目标耗时与上下限由调用方给。
+func proportionalChunk(cur, n int64, took, target time.Duration, lo, hi int64) int64 {
 	if n <= 0 || took <= 0 {
 		return cur
 	}
-	want := int64(float64(cur) * float64(spliceAccountTarget) / float64(took))
+	want := int64(float64(cur) * float64(target) / float64(took))
 	if want > cur*2 {
 		want = cur * 2
 	}
 	if want < cur/2 {
 		want = cur / 2
 	}
-	if want > spliceAccountChunk {
-		want = spliceAccountChunk
+	if want > hi {
+		want = hi
 	}
-	if want < spliceAccountChunkMin {
-		want = spliceAccountChunkMin
+	if want < lo {
+		want = lo
 	}
 	return want
 }
@@ -812,8 +817,16 @@ func spliceCopyAccounted(dst io.Writer, src io.Reader, account func(int64)) erro
 	}
 }
 
-// spliceSegmentMax 是分段直通单段的上限。
-const spliceSegmentMax = 1 << 20
+// 分段直通的段长:按实测速率自适应,每段目标耗时 spliceSegmentTarget,夹在 [spliceSegmentMin, spliceSegmentMax]。
+// 入站中止一条流时要等当前这一段搬完才能收尾(见 SpliceFramer),段长固定 1 MiB 时,慢链路上一段就要好几秒,
+// 客户端等不到收尾只好把整条连接关掉,还白收一整段。按速率收段长之后,中止的等待不超过约一个目标耗时。
+const (
+	spliceSegmentMax    = 1 << 20
+	spliceSegmentMin    = 64 << 10
+	spliceSegmentTarget = 250 * time.Millisecond
+	// 每交一段给内核之前,发送缓冲里未发出的字节最多这么多(再按段长放宽到两段),见 waitSendRoom。
+	spliceBacklogMin = 256 << 10
+)
 
 // spliceFramed 是给设了 session.SpliceFramer 的入站用的直通,目标读完返回 nil。
 //
@@ -836,6 +849,7 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 	}
 	var broken error
 	defer func() { f.Finish(broken) }()
+	seg := int64(spliceSegmentMin)
 	for {
 		n, err := readableBytes(src)
 		if err == io.EOF {
@@ -844,9 +858,15 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 		if err != nil {
 			return err
 		}
-		if n > spliceSegmentMax {
-			n = spliceSegmentMax
+		full := n >= seg // 这一段取满了:耗时反映的是往客户端写的速度,可以拿来调段长
+		if n > seg {
+			n = seg
 		}
+		// 发送缓冲里积压的未发数据先降下来再交下一段:积压都排在中止后的 END 前面。
+		// 计时从这里起:稳态下「等积压降下来 + 拷进内核」才是一段真正送出去的耗时;只计拷贝的话,
+		// 发送缓冲有空时拷贝几乎瞬间完成,段长会一路涨到上限,积压上限也跟着放宽,把关形同虚设。
+		start := time.Now()
+		waitSendRoom(dst, max(spliceBacklogMin, int(2*seg)))
 		setCork(dst, true)
 		ok, err := f.Segment(n)
 		if err != nil || !ok {
@@ -855,6 +875,7 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 			return err
 		}
 		w, err := io.CopyN(dst, src, n)
+		took := time.Since(start)
 		setCork(dst, false)
 		if w > 0 {
 			account(w)
@@ -864,6 +885,9 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 			return err
 		}
 		f.Written()
+		if full {
+			seg = proportionalChunk(seg, w, took, spliceSegmentTarget, spliceSegmentMin, spliceSegmentMax)
+		}
 		if touch != nil {
 			touch()
 		}
