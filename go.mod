@@ -4,6 +4,7 @@ go 1.27
 
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
+	github.com/cloudflare/circl v1.6.5
 	github.com/ghodss/yaml v1.0.1-0.20220118164431-d8423dcdf344
 	github.com/golang/mock v1.7.0-rc.1
 	github.com/google/go-cmp v0.7.0
@@ -20,7 +21,7 @@ require (
 	github.com/sagernet/sing v0.5.1
 	github.com/stretchr/testify v1.12.1
 	github.com/vishvananda/netlink v1.3.1
-	github.com/xtls/reality v0.0.0-20261014101318-83f621788ca8
+	github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0
 	github.com/yuin/gopher-lua v1.1.2
 	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
 	golang.org/x/crypto v0.58.0
@@ -42,13 +43,13 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.2.3 // indirect
+	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/huin/goupnp v1.2.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
 	github.com/juju/ratelimit v1.0.2 // indirect
-	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/pion/dtls/v3 v3.1.5 // indirect
@@ -68,3 +69,7 @@ require (
 // sing v0.5.1 打了一处补丁(udpnat 发送不再无限阻塞,见 third_party/sing/MMWX_PATCH.md)。
 // 依赖方的 replace 在编 agent 时不生效,agent 的 go.mod 里要有同样一行(路径换成 ../xray-core-vision-limiter/third_party/sing)。
 replace github.com/sagernet/sing => ./third_party/sing
+
+// reality 锁在 v26.10.10 的版本并打了一处补丁(接受不带 X25519MLKEM768 的 Client Hello;为何不能升到 20261014 也写在里面),
+// 见 third_party/reality/MMWX_PATCH.md。同 sing:agent 的 go.mod 里要有同样一行(路径换成 ../xray-core-vision-limiter/third_party/reality)。
+replace github.com/xtls/reality => ./third_party/reality
