@@ -62,7 +62,10 @@ func TestWireguard(t *testing.T) {
 		},
 		Outbound: []*core.OutboundHandlerConfig{
 			{
-				ProxySettings: serial.ToTypedMessage(&freedom.Config{}),
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{}),
 			},
 		},
 	}
@@ -82,9 +85,9 @@ func TestWireguard(t *testing.T) {
 					Listen:   net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
-					Address:  net.NewIPOrDomain(dest.Address),
-					Port:     uint32(dest.Port),
-					Networks: []net.Network{net.Network_TCP},
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
 				}),
 			},
 		},
@@ -102,6 +105,7 @@ func TestWireguard(t *testing.T) {
 						AllowedIps: []string{"0.0.0.0/0", "::0/0"},
 					}},
 				}),
+				SenderSettings: serial.ToTypedMessage(&proxyman.SenderConfig{}),
 			},
 		},
 	}

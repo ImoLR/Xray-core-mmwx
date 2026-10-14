@@ -279,6 +279,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.ob.CanSpliceCopy = 1
 			}
 		}
+		SuppressOuterCloseNotify(w.conn)
 		readerConn, readCounter, _ := UnwrapRawConn(w.conn)
 		// 给 mmw-agent 这类下游一次包装底层 conn 的机会(per-user 限速),
 		// 未注册 hook 时原样返回,无开销。详见 vision_limiter_hook.go。
@@ -346,6 +347,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			// 	w.ob.CanSpliceCopy = 1
 			// }
 		}
+		SuppressOuterCloseNotify(w.conn)
 		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
 		// 同 Reader 路径,给下游 per-user 限速钩子一次机会包装底层 conn。
 		// !isUplink 的 Writer 写的是客户端连接(入站侧);isUplink 的是出站侧写往落地服务器。
@@ -678,6 +680,19 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 	}
 }
 
+type CloseNotifySuppressor interface {
+	SuppressCloseNotify()
+}
+
+// Close our local TLS conn instance might send a incorrect close_notify alert
+// if the XTLS direct copy mode is enabled and cause TLS BAD_RECORD_MAC on users' browser
+// Close the underlying connection directly to avoid this issue.
+func SuppressOuterCloseNotify(conn net.Conn) {
+	if suppressor, ok := stat.TryUnwrapStatsConn(conn).(CloseNotifySuppressor); ok {
+		suppressor.SuppressCloseNotify()
+	}
+}
+
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
 func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 	var readCounter, writerCounter stats.Counter
@@ -880,7 +895,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	for {
 		inbound := session.InboundFromContext(ctx)
 		outbounds := session.OutboundsFromContext(ctx)
-		var splice = inbound.CanSpliceCopy == 1
+		splice := inbound.CanSpliceCopy == 1
 		for _, ob := range outbounds {
 			if ob.CanSpliceCopy != 1 {
 				splice = false

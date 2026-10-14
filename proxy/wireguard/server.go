@@ -18,430 +18,189 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
-	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/proxy"
+	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"golang.org/x/crypto/curve25519"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-var nullDestination = net.TCPDestination(net.AnyIP, 0)
-
-// 支持 api 侧的 AddUser/RemoveUser 等动态用户管理。
-var _ proxy.UserManager = (*Server)(nil)
-
-var _ common.Closable = (*Server)(nil)
-
 type Server struct {
-	bindServer *netBindServer
-
-	info          routingInfo
+	conf          *DeviceConfig
+	ctx           context.Context
 	policyManager policy.Manager
+	dispatcher    routing.Dispatcher
 
-	// 以下为支持 per-user 识别与动态 peer 管理所加,移植自上游 345c76f9(#6360)。
-	// tun 过去被就地丢弃,导致入站运行期不可回收(每次整入站重建都会泄漏一套
-	// gvisor stack + wireguard Device + receive goroutine);保存下来同时也是
-	// AddUser/RemoveUser 走 IpcSet 增量改 peer 的前提。
-	conf  *DeviceConfig
-	tun   Tunnel
-	pub   [32]byte
-	users *sync.Map // key: [32]byte 公钥 -> *protocol.MemoryUser
+	tag             string
+	src             net.Destination
+	sniffingRequest session.SniffingRequest
+	streamSettings  *internet.MemoryStreamConfig
+	uplinkCounter   stats.Counter
+	downlinkCounter stats.Counter
+
+	tun   tun.Device
+	stack *stack.Stack
+	dev   *device.Device
 	mu    sync.Mutex
-}
 
-type routingInfo struct {
-	ctx        context.Context
-	dispatcher routing.Dispatcher
-	inboundTag *session.Inbound
-	contentTag *session.Content
+	pub   [32]byte
+	users *sync.Map
 }
 
 func NewServer(ctx context.Context, conf *DeviceConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
+	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
+	d := v.GetFeature(routing.DispatcherType()).(routing.Dispatcher)
 
-	endpoints, hasIPv4, hasIPv6, err := parseEndpoints(conf)
+	inbound := session.InboundFromContext(ctx)
+	content := session.ContentFromContext(ctx)
+	streamSettings := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig)
+	tag := inbound.Tag
+	var uplinkCounter stats.Counter
+	var downlinkCounter stats.Counter
+	if len(tag) > 0 && p.ForSystem().Stats.InboundUplink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + tag + ">>>traffic>>>uplink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			uplinkCounter = c
+		}
+	}
+	if len(tag) > 0 && p.ForSystem().Stats.InboundDownlink {
+		statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
+		name := "inbound>>>" + tag + ">>>traffic>>>downlink"
+		c, _ := statsManager.GetOrRegisterCounter(name)
+		if c != nil {
+			downlinkCounter = c
+		}
+	}
+
+	localAddresses := make([]netip.Addr, 0, len(conf.Endpoint))
+	for _, localaddress := range conf.Endpoint {
+		addr, err := netip.ParseAddr(localaddress)
+		if err == nil {
+			localAddresses = append(localAddresses, addr)
+			continue
+		}
+		prefix, err := netip.ParsePrefix(localaddress)
+		if err == nil {
+			localAddresses = append(localAddresses, prefix.Addr())
+			continue
+		}
+		return nil, err
+	}
+
+	tun, _, stack, err := CreateNetTUN(localAddresses, nil, int(conf.Mtu), false)
 	if err != nil {
 		return nil, err
 	}
 
-	server := &Server{
-		bindServer: &netBindServer{
-			netBind: netBind{
-				dns: v.GetFeature(dns.ClientType()).(dns.Client),
-				dnsOption: dns.IPOption{
-					IPv4Enable: hasIPv4,
-					IPv6Enable: hasIPv6,
-				},
-				workers:   int(conf.NumWorkers),
-				readQueue: make(chan *netReadInfo),
-			},
-		},
-		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
-		conf:          conf,
-		users:         new(sync.Map),
-	}
+	pri := common.Must2(ParseKey(conf.SecretKey))
+	var pub [32]byte
+	curve25519.ScalarBaseMult(&pub, pri)
 
-	if err := server.loadUsers(conf); err != nil {
-		return nil, err
-	}
-	if pub, err := serverPubKey(conf.SecretKey); err == nil {
-		server.pub = pub
-	} else {
-		// 只用于 AddUser 时挡「peer 公钥 == 服务端公钥」,推导不出来不该拦住启动。
-		errors.LogWarningInner(ctx, err, "wireguard: cannot derive server public key")
-	}
-
-	tun, err := conf.createTun()(endpoints, int(conf.Mtu), server.forwardConnection)
+	// mmwx:重复公钥 / email、allowed_ips 重叠的坏配置在这里拒绝,见 users_validate.go。
+	all, err := collectDeviceUsers(conf.Users)
 	if err != nil {
-		return nil, err
-	}
-
-	if err = tun.BuildDevice(server.buildIPCRequest(), server.bindServer); err != nil {
 		_ = tun.Close()
 		return nil, err
 	}
-	server.tun = tun
+	users := &sync.Map{}
+	for _, user := range all {
+		users.Store(user.Account.(*MemoryAccount).Pub, user)
+	}
 
-	return server, nil
+	s := &Server{
+		conf:          conf,
+		ctx:           core.ToBackgroundDetachedContext(ctx),
+		policyManager: p,
+		dispatcher:    d,
+
+		tag:             inbound.Tag,
+		src:             inbound.Source,
+		sniffingRequest: content.SniffingRequest,
+		streamSettings:  streamSettings,
+		uplinkCounter:   uplinkCounter,
+		downlinkCounter: downlinkCounter,
+
+		tun:   tun,
+		stack: stack,
+
+		pub:   pub,
+		users: users,
+	}
+	// Install the stack's protocol handlers before the device can deliver packets to it (Start -> dev.Up).
+	CreateForwarder(stack, s.HandleConnection)
+	CreateICMPEchoResponder(stack)
+	return s, nil
 }
 
-// loadUsers 把配置里的 peer 统一收敛成 users 表。
-// 两个来源:
-//   - conf.Users —— 新形态,带 email,限速/连接数/流量统计据此归属
-//   - conf.Peers —— 旧形态,同一公钥未在 Users 出现时补一个无 email 的用户,
-//     保证既有配置行为不变(只是仍然没有用户身份,与今天一致)
-func (s *Server) loadUsers(conf *DeviceConfig) error {
-	all, err := collectDeviceUsers(conf.Users, conf.Peers)
-	if err != nil {
-		return err
-	}
-	for _, u := range all {
-		s.users.Store(u.Account.(*MemoryAccount).Pub, u)
-	}
-	return nil
-}
-
-// ValidateDevicePeers 按 NewServer 加载时的同一套规则校验服务端(入站)设备的
-// 用户与匿名 peer,不创建任何设备。
-//
-// infra/conf 在 WireGuardConfig.Build(!IsClient)里调用它,让重复公钥、allowed_ips
-// 非规范或彼此重叠这类坏配置在 LoadJSONConfig 阶段就被拒绝。过去要等到 NewServer
-// 才炸:写盘前的配置测试(只跑 LoadJSONConfig)拦不住,整入站替换时旧入站已经删掉、
-// 新的又加不回来,下次重启整机 xray 起不来。
-//
-// 与 NewServer 共用 collectDeviceUsers,两处不会漂移:比 NewServer 更严会让原本
-// 能跑的配置升级后起不来,更松则拦不住上面的问题。
-func ValidateDevicePeers(users []*protocol.User, peers []*PeerConfig) error {
-	_, err := collectDeviceUsers(users, peers)
-	return err
-}
-
-// collectDeviceUsers 把 users 与匿名 peers 收敛成设备实际装载的用户集合,并做全部校验:
-//   - users:公钥按解码后的 32 字节比较、互不重复;非空 email 互不重复
-//   - peers:公钥已出现过(用户或更早的匿名 peer)的静默忽略 ——
-//     与过去 sync.Map.LoadOrStore 的语义一致,不报错,也不参与后面的重叠检查
-//   - 剩下的全体交给 validateAllowedIPs
-func collectDeviceUsers(users []*protocol.User, peers []*PeerConfig) ([]*protocol.MemoryUser, error) {
-	all := make([]*protocol.MemoryUser, 0, len(users)+len(peers))
-	seenPub := make(map[[32]byte]bool, len(users)+len(peers))
-	seenEmail := make(map[string]bool, len(users))
-
-	for _, u := range users {
-		mu, err := u.ToMemoryUser()
-		if err != nil {
-			return nil, errors.New("failed to parse wireguard user ", u.Email).Base(err)
-		}
-		acc, ok := mu.Account.(*MemoryAccount)
-		if !ok {
-			return nil, errors.New("unexpected account type for wireguard user ", u.Email)
-		}
-		if seenPub[acc.Pub] {
-			return nil, errors.New("duplicated wireguard peer public key for user ", u.Email)
-		}
-		// 同一 email 两个 peer:RemoveUser(email) 只删得掉其中一个,两份流量记到同一个人头上。
-		if mu.Email != "" {
-			if seenEmail[mu.Email] {
-				return nil, errors.New("duplicated wireguard peer email ", mu.Email)
-			}
-			seenEmail[mu.Email] = true
-		}
-		seenPub[acc.Pub] = true
-		all = append(all, mu)
-	}
-
-	for _, p := range peers {
-		acc, err := p.AsAccount()
-		if err != nil {
-			return nil, err
-		}
-		pub := acc.(*MemoryAccount).Pub
-		if seenPub[pub] {
-			continue
-		}
-		seenPub[pub] = true
-		all = append(all, &protocol.MemoryUser{Account: acc})
-	}
-
-	if err := validateAllowedIPs(all); err != nil {
-		return nil, err
-	}
-	return all, nil
-}
-
-// validateUserAddrs 对当前 users 表加上待加入的 extra 做 validateAllowedIPs。
-func (s *Server) validateUserAddrs(extra *protocol.MemoryUser) error {
-	var all []*protocol.MemoryUser
-	s.users.Range(func(key, value any) bool {
-		all = append(all, value.(*protocol.MemoryUser))
-		return true
-	})
-	if extra != nil {
-		all = append(all, extra)
-	}
-	return validateAllowedIPs(all)
-}
-
-// validateAllowedIPs 校验 allowed_ips 足以作为「身份」使用。
-//
-// GetUserByAddr 是按隧道内源地址落到某个 peer 的 allowed_ips 上来归属流量的,
-// 所以地址集合一旦重叠,归属就取决于 sync.Map 的遍历顺序 —— 表现为流量、
-// 配额和限速随机算到另一个用户头上,且没有任何报错。宁可在启动/加用户时炸掉。
-//
-// 没有任何 peer 带 email 时直接放行:那是纯粹的旧配置,本来就没有用户身份,
-// allowed_ips 写 0.0.0.0/0 是合法且常见的,不能因为本次改动把它判成非法。
-func validateAllowedIPs(users []*protocol.MemoryUser) error {
-	type entry struct {
-		name string
-		acc  *MemoryAccount
-	}
-
-	var all []entry
-	hasEmail := false
-	for _, u := range users {
-		acc, ok := u.Account.(*MemoryAccount)
-		if !ok {
-			continue
-		}
-		name := u.Email
-		if name == "" {
-			name = "peer " + hex.EncodeToString(acc.Pub[:4])
-		} else {
-			hasEmail = true
-		}
-		all = append(all, entry{name, acc})
-	}
-	if !hasEmail {
-		return nil
-	}
-
-	for _, e := range all {
-		if len(e.acc.AllowedIPs) == 0 {
-			return errors.New("wireguard ", e.name, ": empty allowed_ips, user would be unidentifiable")
-		}
-		for _, pfx := range e.acc.AllowedIPs {
-			if pfx.Masked() != pfx {
-				return errors.New("wireguard ", e.name, ": allowed_ip ", pfx.String(), " is not in canonical form")
-			}
-		}
-	}
-
-	for i := range all {
-		for j := i + 1; j < len(all); j++ {
-			for _, a := range all[i].acc.AllowedIPs {
-				for _, b := range all[j].acc.AllowedIPs {
-					if a.Contains(b.Addr()) || b.Contains(a.Addr()) {
-						return errors.New("wireguard: allowed_ip ", a.String(), " of ", all[i].name,
-							" overlaps ", b.String(), " of ", all[j].name, "; traffic attribution would be ambiguous")
-					}
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// buildIPCRequest 从 users 表生成设备初始配置。
-// 服务端模式不写 peer 的 endpoint:客户端地址由握手学习(且会漫游),
-// 写死反而会在客户端换网时把包发到旧地址。
-func (s *Server) buildIPCRequest() string {
-	var request strings.Builder
-
-	request.WriteString("private_key=" + s.conf.SecretKey + "\n")
-	// placeholder, we'll handle actual port listening on Xray
-	request.WriteString("listen_port=1337\n")
-
-	s.users.Range(func(key, value any) bool {
-		request.WriteString(peerIPCRequest(value.(*protocol.MemoryUser).Account.(*MemoryAccount), false))
-		return true
-	})
-
-	return request.String()
-}
-
-// serverPubKey 由私钥推导服务端公钥。私钥到达这里时已由 infra/conf 统一成 hex。
-func serverPubKey(secret string) ([32]byte, error) {
-	var priv, pub [32]byte
-	dat, err := hex.DecodeString(secret)
-	if err != nil || len(dat) != 32 {
-		return pub, errors.New("invalid wireguard secret key")
-	}
-	copy(priv[:], dat)
-	curve25519.ScalarBaseMult(&pub, &priv)
-	return pub, nil
-}
-
-// Network implements proxy.Inbound.
-func (*Server) Network() []net.Network {
-	return []net.Network{net.Network_UDP}
-}
-
-// Process implements proxy.Inbound.
-func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
-	s.info = routingInfo{
-		ctx:        ctx,
-		dispatcher: dispatcher,
-		inboundTag: session.InboundFromContext(ctx),
-		contentTag: session.ContentFromContext(ctx),
-	}
-
-	ep, err := s.bindServer.ParseEndpoint(conn.RemoteAddr().String())
-	if err != nil {
-		return err
-	}
-
-	nep := ep.(*netEndpoint)
-	nep.conn = conn
-
-	reader := buf.NewPacketReader(conn)
-	for {
-		mb, err := reader.ReadMultiBuffer()
-		if err != nil {
-			nep.conn = nil
-			buf.ReleaseMulti(mb)
-			return err
-		}
-
-		for i, b := range mb {
-			buff := b.Bytes()
-
-			if b.Len() > 3 {
-				buff[1] = 0
-				buff[2] = 0
-				buff[3] = 0
-			}
-
-			select {
-			case s.bindServer.readQueue <- &netReadInfo{
-				buff:     buff,
-				endpoint: nep,
-			}:
-			case <-s.bindServer.closedCh:
-				nep.conn = nil
-				buf.ReleaseMulti(mb[i:])
-				return errors.New("bind closed")
-			}
-		}
-	}
-}
-
-func (s *Server) forwardConnection(dest net.Destination, conn net.Conn) {
-	if s.info.dispatcher == nil {
-		errors.LogError(s.info.ctx, "unexpected: dispatcher == nil")
-		return
-	}
-
-	remote := conn.RemoteAddr()
-	if remote == nil {
-		errors.LogError(s.info.ctx, "wireguard: nil remote addr")
-		return
-	}
-
-	ctx, cancel := context.WithCancel(core.ToBackgroundDetachedContext(s.info.ctx))
-	sid := session.NewID()
-	ctx = c.ContextWithID(ctx, sid)
-	inbound := session.Inbound{} // since promiscuousModeHandler mixed-up context, we shallow copy inbound (tag) and content (configs)
-	if s.info.inboundTag != nil {
-		inbound = *s.info.inboundTag
-	}
-	inbound.Name = "wireguard"
-	inbound.CanSpliceCopy = 3
-
-	// overwrite the source to use the tun address for each sub context.
-	// Since gvisor.ForwarderRequest doesn't provide any info to associate the sub-context with the Parent context
-	// Currently we have no way to link to the original **public** source address —— 但隧道内的源地址是有的,
-	// 而它足以定位用户:wireguard-go 在解密后做 cryptokey routing 校验(device/receive.go),
-	// 源地址不在该 peer 的 allowed_ips 里的包会被直接丢弃,所以 tun 内地址不可伪造。
-	inbound.Source = net.DestinationFromAddr(remote)
-
-	// 填 User 之后,限速 / 并发连接数 / per-user 流量统计三者一并生效 ——
-	// 它们都只依赖 si.User.Email,与协议无关。
-	if user := s.userByConnAddr(remote); user != nil {
-		inbound.User = user
-	}
-	ctx = session.ContextWithInbound(ctx, &inbound)
-	content := new(session.Content)
-	if s.info.contentTag != nil {
-		content.SniffingRequest = s.info.contentTag.SniffingRequest
-	}
-	ctx = session.ContextWithContent(ctx, content)
-	ctx = session.SubContextFromMuxInbound(ctx)
-
-	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
-		From:   nullDestination,
-		To:     dest,
-		Status: log.AccessAccepted,
-		Reason: "",
-	})
-
-	err := s.info.dispatcher.DispatchLink(ctx, dest, &transport.Link{
-		Reader: buf.NewReader(conn),
-		Writer: buf.NewWriter(conn),
-	})
-
-	if err != nil {
-		errors.LogInfoInner(ctx, err, "connection ends")
-	}
-
-	cancel()
-	conn.Close()
-}
-
-// Close 回收 tun/device。入站被销毁时由 app/proxyman/inbound 的 worker
-// 经 common.Close(w.proxy) 调用 —— 过去 Server 没有这个方法,加上 NewServer
-// 就地丢弃 tun 句柄,每次入站重建都会漏一套 gvisor stack + Device + 收包 goroutine。
-func (s *Server) Close() error {
+func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if s.tun == nil {
-		return nil
+	if s.dev == nil {
+		return errors.New("too early")
 	}
-	err := s.tun.Close()
-	s.tun = nil
-	return err
+	peer := user.Account.(*MemoryAccount)
+	if peer.Pub == s.pub {
+		return errors.New("invalid public key")
+	}
+	if err := s.checkNewUser(user); err != nil {
+		return err
+	}
+	var sb strings.Builder
+	sb.WriteString("public_key=" + hex.EncodeToString(peer.Pub[:]) + "\n")
+	sb.WriteString("replace_allowed_ips=true\n")
+	for i := range peer.AllowedIPs {
+		sb.WriteString("allowed_ip=" + peer.AllowedIPs[i].String() + "\n")
+	}
+	if peer.PreSharedKey != "" {
+		sb.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
+	}
+	if peer.KeepAlive != "" {
+		sb.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
+	}
+	err := s.dev.IpcSet(sb.String())
+	if err != nil {
+		return err
+	}
+	s.users.Store(peer.Pub, user)
+	return nil
 }
 
-// userByConnAddr 用隧道内源地址反查用户。取不到时返回 nil(调用方按匿名处理),
-// 不阻断连接 —— 旧配置(只有 peers、没有 users)下本来就没有用户身份。
-func (s *Server) userByConnAddr(remote net.Addr) *protocol.MemoryUser {
-	var addr netip.Addr
-	switch v := remote.(type) {
-	case *net.TCPAddr:
-		addr, _ = netip.AddrFromSlice(v.IP)
-	case *net.UDPAddr:
-		addr, _ = netip.AddrFromSlice(v.IP)
-	default:
-		errors.LogError(s.info.ctx, "wireguard: invalid addr type ", reflect.TypeOf(v))
-		return nil
+func (s *Server) RemoveUser(ctx context.Context, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dev == nil {
+		return errors.New("too early")
 	}
-	return s.GetUserByAddr(context.Background(), addr.Unmap())
+	if user := s.GetUser(ctx, email); user != nil {
+		peer := user.Account.(*MemoryAccount)
+		err := s.dev.IpcSet("public_key=" + hex.EncodeToString(peer.Pub[:]) + "\nremove=true\n")
+		if err != nil {
+			return err
+		}
+		s.users.Delete(peer.Pub)
+	}
+	return nil
 }
 
-// GetUserByAddr 按隧道内地址查用户。allowed_ips 必须是互不重叠的 host 前缀,
-// 这一点由 infra/conf 在 server 模式下强制校验(否则一个 /0 就会吞掉全部流量,
-// 让全节点的流量与配额都算到同一个用户头上)。
+func (s *Server) GetUser(ctx context.Context, email string) (user *protocol.MemoryUser) {
+	s.users.Range(func(key, value any) bool {
+		if value.(*protocol.MemoryUser).Email == email {
+			user = value.(*protocol.MemoryUser)
+			return false
+		}
+		return true
+	})
+	return
+}
+
 func (s *Server) GetUserByAddr(ctx context.Context, addr netip.Addr) (user *protocol.MemoryUser) {
 	s.users.Range(func(key, value any) bool {
 		peer := value.(*protocol.MemoryUser).Account.(*MemoryAccount)
@@ -456,19 +215,8 @@ func (s *Server) GetUserByAddr(ctx context.Context, addr netip.Addr) (user *prot
 	return
 }
 
-func (s *Server) GetUser(ctx context.Context, email string) (user *protocol.MemoryUser) {
-	s.users.Range(func(key, value any) bool {
-		if value.(*protocol.MemoryUser).Email == email {
-			user = value.(*protocol.MemoryUser)
-			return false
-		}
-		return true
-	})
-	return
-}
-
 func (s *Server) GetUsers(ctx context.Context) (users []*protocol.MemoryUser) {
-	s.users.Range(func(key, value any) bool {
+	s.users.Range(func(key, value interface{}) bool {
 		users = append(users, value.(*protocol.MemoryUser))
 		return true
 	})
@@ -476,81 +224,182 @@ func (s *Server) GetUsers(ctx context.Context) (users []*protocol.MemoryUser) {
 }
 
 func (s *Server) GetUsersCount(context.Context) (count int64) {
-	s.users.Range(func(key, value any) bool {
+	s.users.Range(func(key, value interface{}) bool {
 		count++
 		return true
 	})
 	return
 }
 
-// AddUser 增量加一个 peer,不重建入站、不影响在线用户。
-func (s *Server) AddUser(ctx context.Context, user *protocol.MemoryUser) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.tun == nil {
-		return errors.New("wireguard: device not ready")
-	}
-	peer, ok := user.Account.(*MemoryAccount)
-	if !ok {
-		return errors.New("wireguard: unexpected account type")
-	}
-	if peer.Pub == s.pub {
-		return errors.New("wireguard: peer public key must differ from the server's")
-	}
-	if _, dup := s.users.Load(peer.Pub); dup {
-		return errors.New("wireguard: peer public key already exists")
-	}
-	// 同 email 再加一个 peer(典型是换密钥时先加后删):RemoveUser(email) 之后只删得掉
-	// 其中一个,另一个继续以同一身份在线计费。换密钥必须先 RemoveUser 再 AddUser。
-	if user.Email != "" && s.GetUser(ctx, user.Email) != nil {
-		return errors.New("wireguard: peer email already exists: ", user.Email)
-	}
-	if err := s.validateUserAddrs(user); err != nil {
-		return err
-	}
-	if err := s.tun.IpcSet(peerIPCRequest(peer, true)); err != nil {
-		return err
-	}
-	s.users.Store(peer.Pub, user)
+// Network implements proxy.Inbound.Network.
+func (*Server) Network() []net.Network {
+	return []net.Network{}
+}
+
+// Process implements proxy.Inbound.Process.
+func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Connection, dispatcher routing.Dispatcher) error {
 	return nil
 }
 
-// RemoveUser 增量删一个 peer。IpcSet 与内存表必须同步 ——
-// 两者漂移会造成静默的归属错误(限速失效,或流量算到别人头上)。
-func (s *Server) RemoveUser(ctx context.Context, email string) error {
+// Close implements common.Closable.Close.
+func (s *Server) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tun == nil {
-		return errors.New("wireguard: device not ready")
+	if s.dev != nil {
+		s.dev.Close()
+		s.dev = nil
+		s.tun = nil
+	} else if s.tun != nil {
+		s.tun.Close()
+		s.tun = nil
 	}
-	user := s.GetUser(ctx, email)
+	return nil
+}
+
+// Start implements common.Runnable.Start.
+func (s *Server) Start() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dev != nil {
+		return nil
+	}
+	if s.src.Address.Family().IsDomain() {
+		return errors.New("address is domain")
+	}
+	listenFunc := func() (net.PacketConn, error) {
+		var pktConn net.PacketConn
+		var err error
+		if s.streamSettings.FinalMask != nil {
+			pktConn, err = s.streamSettings.FinalMask.ListenPacket(context.Background(), &net.UDPAddr{IP: s.src.Address.IP(), Port: int(s.src.Port)})
+		} else {
+			pktConn, err = internet.ListenSystemPacket(context.Background(), &net.UDPAddr{IP: s.src.Address.IP(), Port: int(s.src.Port)}, s.streamSettings.SocketSettings)
+		}
+		if err != nil {
+			return nil, err
+		}
+		if s.uplinkCounter != nil || s.downlinkCounter != nil {
+			pktConn = &PacketCounterConnection{
+				PacketConn:   pktConn,
+				ReadCounter:  s.uplinkCounter,
+				WriteCounter: s.downlinkCounter,
+			}
+		}
+		return pktConn, nil
+	}
+	bind := &bind{
+		listenFunc: listenFunc,
+	}
+	logger := &device.Logger{
+		Verbosef: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Debug,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+		Errorf: func(format string, args ...any) {
+			log.Record(&log.GeneralMessage{
+				Severity: log.Severity_Error,
+				Content:  fmt.Sprintf(format, args...),
+			})
+		},
+	}
+	dev := device.NewDevice(s.tun, bind, logger)
+	var cfg strings.Builder
+	cfg.WriteString("private_key=" + s.conf.SecretKey + "\n")
+	s.users.Range(func(key, value any) bool {
+		peer := value.(*protocol.MemoryUser).Account.(*MemoryAccount)
+		cfg.WriteString("public_key=" + hex.EncodeToString(peer.Pub[:]) + "\n")
+		for i := range peer.AllowedIPs {
+			cfg.WriteString("allowed_ip=" + peer.AllowedIPs[i].String() + "\n")
+		}
+		if peer.PreSharedKey != "" {
+			cfg.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
+		}
+		if peer.KeepAlive != "" {
+			cfg.WriteString("persistent_keepalive_interval=" + peer.KeepAlive + "\n")
+		}
+		return true
+	})
+	err := dev.IpcSet(cfg.String())
+	if err != nil {
+		return err
+	}
+	err = dev.Up()
+	if err != nil {
+		return err
+	}
+	s.dev = dev
+	return nil
+}
+
+func (s *Server) HandleConnection(conn net.Conn, dest net.Destination) {
+	defer conn.Close()
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	ctx = c.ContextWithID(ctx, session.NewID())
+
+	remote := conn.RemoteAddr()
+	if remote == nil {
+		errors.LogError(context.Background(), "nil remote")
+		return
+	}
+
+	var addr netip.Addr
+	switch v := remote.(type) {
+	case *net.TCPAddr:
+		addr, _ = netip.AddrFromSlice(v.IP)
+	case *net.UDPAddr:
+		addr, _ = netip.AddrFromSlice(v.IP)
+	default:
+		errors.LogError(context.Background(), "invalid addr type ", reflect.TypeOf(v))
+		return
+	}
+
+	user := s.GetUserByAddr(context.TODO(), addr)
 	if user == nil {
-		return nil // 幂等:已经不在了
+		errors.LogError(context.Background(), "nil user form ", remote, " to ", dest)
+		return
 	}
-	peer := user.Account.(*MemoryAccount)
-	if err := s.tun.IpcSet("public_key=" + hex.EncodeToString(peer.Pub[:]) + "\nremove=true\n"); err != nil {
-		return err
+
+	source := net.DestinationFromAddr(remote)
+	inbound := session.Inbound{
+		Name:          "wireguard",
+		Tag:           s.tag,
+		CanSpliceCopy: 3,
+		Source:        source,
+		User:          user,
 	}
-	s.users.Delete(peer.Pub)
-	return nil
+
+	ctx = session.ContextWithInbound(ctx, &inbound)
+	ctx = session.ContextWithContent(ctx, &session.Content{
+		SniffingRequest: s.sniffingRequest,
+	})
+	ctx = session.SubContextFromMuxInbound(ctx)
+
+	ctx = log.ContextWithAccessMessage(ctx, &log.AccessMessage{
+		From:   inbound.Source,
+		To:     dest,
+		Status: log.AccessAccepted,
+		Reason: "",
+	})
+	errors.LogInfo(ctx, "processing from ", source, " to ", dest)
+
+	link := &transport.Link{
+		Reader: &buf.TimeoutWrapperReader{Reader: buf.NewReader(conn)},
+		Writer: buf.NewWriter(conn),
+	}
+	if err := s.dispatcher.DispatchLink(ctx, dest, link); err != nil {
+		errors.LogError(ctx, errors.New("connection closed").Base(err))
+	}
 }
 
-// peerIPCRequest 拼一个 peer 的 IPC 片段。replaceAllowedIPs 用于增量添加时
-// 覆盖既有 allowed_ips,避免同一公钥重复添加后地址集合越滚越大。
-func peerIPCRequest(peer *MemoryAccount, replaceAllowedIPs bool) string {
-	var sb strings.Builder
-	sb.WriteString("public_key=" + hex.EncodeToString(peer.Pub[:]) + "\n")
-	if replaceAllowedIPs {
-		sb.WriteString("replace_allowed_ips=true\n")
+func ParseKey(str string) (*[32]byte, error) {
+	slice, err := hex.DecodeString(str)
+	if err != nil {
+		return nil, err
 	}
-	for i := range peer.AllowedIPs {
-		sb.WriteString("allowed_ip=" + peer.AllowedIPs[i].String() + "\n")
+	if len(slice) != 32 {
+		return nil, errors.New("len(slice) != 32")
 	}
-	if peer.PreSharedKey != "" {
-		sb.WriteString("preshared_key=" + peer.PreSharedKey + "\n")
-	}
-	if peer.KeepAlive != 0 {
-		sb.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", peer.KeepAlive))
-	}
-	return sb.String()
+	return (*[32]byte)(slice), nil
 }

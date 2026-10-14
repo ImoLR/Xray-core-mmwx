@@ -25,7 +25,8 @@ func buildWG(t *testing.T, raw string, isClient bool) (*wireguard.DeviceConfig, 
 
 const wgSecret = `"secretKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="`
 
-// 带 email 的 peer 变成用户(计费/限速/连接数的载体),不带的仍是匿名 peer。
+// 服务端的 peer 都建成用户(合并上游 #6360 之后的形态):带 email 的是计费/限速/连接数的载体,
+// 不带的是 email 为空的匿名用户(能连通,但计不了费、限不了速)。
 func TestWireGuardServerPeersWithEmailBecomeUsers(t *testing.T) {
 	cfg, err := buildWG(t, `{`+wgSecret+`,"peers":[
 		{"email":"alice","publicKey":"ASNFZ4mrze8BI0VniavN7wEjRWeJq83vASNFZ4mrze8=","allowedIPs":["10.7.0.2/32"]},
@@ -34,11 +35,11 @@ func TestWireGuardServerPeersWithEmailBecomeUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if len(cfg.Users) != 1 || cfg.Users[0].Email != "alice" {
-		t.Fatalf("Users = %v, want one user alice", cfg.Users)
+	if len(cfg.Users) != 2 || cfg.Users[0].Email != "alice" || cfg.Users[1].Email != "" {
+		t.Fatalf("Users = %v, want alice + one anonymous user", cfg.Users)
 	}
-	if len(cfg.Peers) != 1 {
-		t.Fatalf("Peers = %d, want 1 anonymous peer", len(cfg.Peers))
+	if len(cfg.Peers) != 0 {
+		t.Fatalf("Peers = %d, want none in server mode", len(cfg.Peers))
 	}
 }
 
