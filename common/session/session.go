@@ -58,6 +58,10 @@ type Inbound struct {
 	CanSpliceCopy int
 	// SpliceFramer 非 nil 时,splice 直通按「段」进行,每段之前先问它。见 SpliceFramer。
 	SpliceFramer SpliceFramer
+	// SpliceGate 非 nil 时,分段直通每段(含交给 SpliceFramerData 的小段)之前调用它:参数是想搬的字节数,
+	// 返回允许搬的字节数(可以更少;<= 0 表示不搬了,直通在两段之间停下)。限速器借它在直通里按段取令牌,
+	// 不必为了限速把连接逼回用户态。等待发生在两段之间,入站中止不受影响。
+	SpliceGate func(n int64) int64
 }
 
 // SpliceFramer 让「同一条连接上先后跑很多条流」的入站也能用 splice 直通。

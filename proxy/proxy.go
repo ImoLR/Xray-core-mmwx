@@ -845,7 +845,9 @@ const (
 // touch 每搬完一段调一次(出站的活动计时器):上行结束后出站把超时改成 DownlinkOnly(线上 2 s),
 // 用户态路径每批数据都会喂它,这里以前不喂,下载搬到一半目标连接就被关、响应截断,
 // 通道也因为分段没写完而报废。喂了之后语义与用户态路径一致:下行静默满 DownlinkOnly 才断。
-func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink func(), account func(int64), touch func()) error {
+//
+// gate 非 nil 时每段之前问它能搬多少(见 session.Inbound.SpliceGate),等令牌期间照样喂活动计时器。
+func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink func(), account func(int64), touch func(), gate func(int64) int64) error {
 	if err := f.Handoff(closeLink); err != nil {
 		return err
 	}
@@ -893,6 +895,21 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 		full := n >= seg // 这一段取满了:耗时反映的是往客户端写的速度,可以拿来调段长
 		if n > seg {
 			n = seg
+		}
+		if gate != nil {
+			if touch != nil {
+				touch()
+			}
+			allowed := gate(n)
+			if allowed <= 0 {
+				return nil // 不搬了(请求结束 / 被踢):停在两段之间,连接上的分段是完整的
+			}
+			if allowed < n {
+				n, full = allowed, false
+			}
+			if touch != nil {
+				touch()
+			}
 		}
 		// 发送缓冲里积压的未发数据先降下来再交下一段:积压都排在中止后的 END 前面。
 		// 计时从这里起:稳态下「等积压降下来 + 拷进内核」才是一段真正送出去的耗时;只计拷贝的话,
@@ -991,7 +1008,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				}
 			}
 			if f := inbound.SpliceFramer; f != nil {
-				return spliceFramed(tc, readerConn, f, func() { _ = common.Close(writer) }, account, timer.Update)
+				return spliceFramed(tc, readerConn, f, func() { _ = common.Close(writer) }, account, timer.Update, inbound.SpliceGate)
 			}
 			err := spliceCopyAccounted(tc, readerConn, account)
 			if err != nil && errors.Cause(err) != io.EOF {

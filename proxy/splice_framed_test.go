@@ -104,7 +104,7 @@ func TestSpliceFramed(t *testing.T) {
 	linkClosed := false
 	errc := make(chan error, 1)
 	go func() {
-		errc <- spliceFramed(inLocal, destLocal, f, func() { linkClosed = true }, func(n int64) { accounted += n }, func() { touches++ })
+		errc <- spliceFramed(inLocal, destLocal, f, func() { linkClosed = true }, func(n int64) { accounted += n }, func() { touches++ }, nil)
 	}()
 
 	// 客户端:按「长度 · 数据」读,直到收够
@@ -162,7 +162,7 @@ func TestSpliceFramedSourceErrorBetweenSegments(t *testing.T) {
 
 	f := &testFramer{t: t, conn: inLocal, finish: make(chan error, 1)}
 	errc := make(chan error, 1)
-	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil) }()
+	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil, nil) }()
 
 	_, _ = destRemote.Write(make([]byte, 100_000))
 	time.Sleep(100 * time.Millisecond) // 等这批搬完,循环停在「等下一批」上
@@ -193,7 +193,7 @@ func TestSpliceFramedStoppedByInbound(t *testing.T) {
 	}()
 	f := &testFramer{t: t, conn: inLocal, finish: make(chan error, 1), stopAfter: 3}
 	errc := make(chan error, 1)
-	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil) }()
+	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil, nil) }()
 
 	// 读掉 Handoff 的头和 3 段,之后连接上不该再有任何字节
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -265,7 +265,7 @@ func TestSpliceFramedSmallPiecesGoAsData(t *testing.T) {
 	var accounted int64
 	errc := make(chan error, 1)
 	go func() {
-		errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(n int64) { accounted += n }, nil)
+		errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(n int64) { accounted += n }, nil, nil)
 	}()
 	var got []byte
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -300,5 +300,79 @@ func TestSpliceFramedSmallPiecesGoAsData(t *testing.T) {
 	}
 	if f.segs == 0 {
 		t.Fatal("the large part did not go through segments")
+	}
+}
+
+// 限速闸门:每段之前问能搬多少,搬的字节不超过它给的;闸门说不搬了(<= 0),直通停在两段之间、Finish(nil)。
+func TestSpliceFramedGate(t *testing.T) {
+	destRemote, destLocal := tcpPair(t)
+	inLocal, client := tcpPair(t)
+	payload := make([]byte, 600<<10)
+	_, _ = rand.Read(payload)
+	go func() {
+		_, _ = destRemote.Write(payload)
+		_ = destRemote.CloseWrite()
+	}()
+	f := &testFramer{t: t, conn: inLocal, finish: make(chan error, 1)}
+	const gateCap = 10 << 10
+	var granted int64
+	calls := 0
+	gate := func(n int64) int64 {
+		calls++
+		if n > gateCap {
+			n = gateCap
+		}
+		granted += n
+		return n
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil, gate) }()
+	var got []byte
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for len(got) < len(payload) {
+		var hdr [4]byte
+		if _, err := io.ReadFull(client, hdr[:]); err != nil {
+			t.Fatalf("after %d bytes: %v", len(got), err)
+		}
+		n := binary.BigEndian.Uint32(hdr[:])
+		if n > gateCap {
+			t.Fatalf("segment of %d bytes past the gate's %d", n, gateCap)
+		}
+		seg := make([]byte, n)
+		if _, err := io.ReadFull(client, seg); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, seg...)
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-f.finish; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("bytes changed")
+	}
+	if granted != int64(len(payload)) || calls < len(payload)/gateCap {
+		t.Fatalf("granted %d over %d calls", granted, calls)
+	}
+
+	// the gate says stop: the splice ends between segments, cleanly
+	destRemote2, destLocal2 := tcpPair(t)
+	inLocal2, _ := tcpPair(t)
+	go func() { _, _ = destRemote2.Write(payload) }()
+	f2 := &testFramer{t: t, conn: inLocal2, finish: make(chan error, 1)}
+	stopAt := 3
+	gate2 := func(n int64) int64 {
+		if stopAt--; stopAt < 0 {
+			return 0
+		}
+		return min(n, gateCap)
+	}
+	if err := spliceFramed(inLocal2, destLocal2, f2, func() {}, func(int64) {}, nil, gate2); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-f2.finish; err != nil || f2.segs != 3 {
+		t.Fatalf("finish %v after %d segments", err, f2.segs)
 	}
 }
