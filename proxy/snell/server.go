@@ -408,6 +408,12 @@ func (s *Server) handleUDP(ctx context.Context, reader snellReader, writer snell
 			b.Release()
 			return err
 		}
+		// 每个数据报标上它自己的目标。udp.Dispatcher 整个会话只按第一个目标建一条链路,
+		// 不标的话之后发往别处的数据报全会被送到第一个目标(游戏 / 语音 / P2P 这类一个会话
+		// 要和多个地址通信的应用就坏了);直连出站认 b.UDP,按包各发各的(trojan / shadowsocks
+		// / anytls 的服务端都是这么做的)。会话走哪个出站仍由第一个目标的路由决定。
+		target := dest
+		b.UDP = &target
 		// 逐包挂日志:UDP 一条隧道会打到很多目标,不能共用一条 AccessMessage。
 		udpServer.Dispatch(accessLogCtx(ctx, dest), dest, b)
 	}
