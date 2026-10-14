@@ -2,6 +2,7 @@ package wireguard
 
 import (
 	"encoding/hex"
+	"strconv"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
@@ -73,10 +74,40 @@ func collectDeviceUsers(users []*protocol.User) ([]*protocol.MemoryUser, error) 
 		all = append(all, mu)
 	}
 
+	for _, mu := range all {
+		if err := validatePeerParams(mu); err != nil {
+			return nil, err
+		}
+	}
 	if err := validateAllowedIPs(all); err != nil {
 		return nil, err
 	}
 	return all, nil
+}
+
+// validatePeerParams 检查要装进设备的 peer 参数能被 wireguard-go 的 IPC 接受。
+//
+// 合并上游之前,设备在 NewServer(core.New)里就建好并下发 IPC,preSharedKey 不是 32 字节、keepAlive 超过
+// uint16 这类坏配置当场被拒;上游把建设备挪到了 Start(),它们能过 LoadJSONConfig 和 core.New,
+// 要到真正启动时才失败 —— 那时整机 xray 都起不来。这里把判定提前回原来的位置。被丢弃的重复匿名 peer
+// 进不了设备,不在这里查(与之前一致)。
+func validatePeerParams(mu *protocol.MemoryUser) error {
+	acc := mu.Account.(*MemoryAccount)
+	name := mu.Email
+	if name == "" {
+		name = "peer " + hex.EncodeToString(acc.Pub[:4])
+	}
+	if acc.PreSharedKey != "" {
+		if k, err := hex.DecodeString(acc.PreSharedKey); err != nil || len(k) != 32 {
+			return errors.New("wireguard ", name, ": preSharedKey is not 32 bytes")
+		}
+	}
+	if acc.KeepAlive != "" {
+		if _, err := strconv.ParseUint(acc.KeepAlive, 10, 16); err != nil {
+			return errors.New("wireguard ", name, ": invalid keepAlive ", acc.KeepAlive)
+		}
+	}
+	return nil
 }
 
 // checkNewUser 是 AddUser 在下发给设备之前的检查:公钥、email 不能与现有用户重复,地址不能与现有用户重叠。

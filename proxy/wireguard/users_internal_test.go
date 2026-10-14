@@ -263,6 +263,27 @@ func TestValidateDeviceUsersAgreesWithLoadUsers(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// 上游把建设备挪到 Start 之后,这两类在 NewServer 里不再被 IPC 拦下,改由 validatePeerParams 提前拒。
+			name:    "psk-not-32-bytes",
+			users:   []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, PreSharedKey: strings.Repeat("ab", 15)})},
+			wantErr: true,
+		},
+		{
+			name:    "keepalive-over-uint16",
+			users:   []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, KeepAlive: "70000"})},
+			wantErr: true,
+		},
+		{
+			name:  "psk-and-keepalive-ok",
+			users: []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, PreSharedKey: strings.Repeat("ab", 32), KeepAlive: "25"})},
+		},
+		{
+			// 被丢弃的重复匿名 peer 进不了设备,参数不查(与合并上游前一致)。
+			name:  "dropped-anonymous-duplicate-params-unchecked",
+			users: []*protocol.User{named("alice", peer(pubHex(2), "10.0.0.2/32"))},
+			peers: []*PeerConfig{{PublicKey: pubHex(2), AllowedIps: []string{"0.0.0.0/0"}, PreSharedKey: "abcd", KeepAlive: "70000"}},
+		},
+		{
 			name:    "unparsable-allowed-ip",
 			users:   []*protocol.User{named("alice", peer(pubHex(2), "10.0.0.300/32"))},
 			wantErr: true,
