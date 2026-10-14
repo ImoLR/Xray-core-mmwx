@@ -220,3 +220,85 @@ func TestSpliceFramedStoppedByInbound(t *testing.T) {
 		t.Fatalf("stray bytes after the inbound stopped the splice: %q %v", next, err)
 	}
 }
+
+// dataFramer 在 testFramer 之上实现 SpliceFramerData:小段用同样的「长度 · 数据」写上线,单独计数。
+type dataFramer struct {
+	*testFramer
+	datas int
+}
+
+func (f *dataFramer) Data(p []byte) (bool, error) {
+	if len(p) == 0 || len(p) >= spliceSmall {
+		f.t.Errorf("data piece of %d bytes", len(p))
+	}
+	if f.inSegment {
+		f.t.Error("Data in the middle of a segment")
+	}
+	f.datas++
+	hdr := make([]byte, 4)
+	binary.BigEndian.PutUint32(hdr, uint32(len(p)))
+	_, err := f.conn.Write(append(hdr, p...))
+	return true, err
+}
+
+// 交互式流量:源一点一点地来,每次可读的都不到 spliceSmall——入站支持 SpliceFramerData 时这些小段走 Data,
+// 不再一段一个分段头 + 直通;字节与记账都不变,大段照旧直通。
+func TestSpliceFramedSmallPiecesGoAsData(t *testing.T) {
+	destRemote, destLocal := tcpPair(t)
+	inLocal, client := tcpPair(t)
+	var want []byte
+	for i := 0; i < 40; i++ {
+		want = append(want, bytes.Repeat([]byte{byte(i)}, 300)...)
+	}
+	big := make([]byte, 200<<10)
+	_, _ = rand.Read(big)
+	want = append(want, big...)
+	go func() {
+		for i := 0; i < 40; i++ {
+			_, _ = destRemote.Write(want[i*300 : (i+1)*300])
+			time.Sleep(3 * time.Millisecond)
+		}
+		_, _ = destRemote.Write(big)
+		_ = destRemote.CloseWrite()
+	}()
+	f := &dataFramer{testFramer: &testFramer{t: t, conn: inLocal, finish: make(chan error, 1)}}
+	var accounted int64
+	errc := make(chan error, 1)
+	go func() {
+		errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(n int64) { accounted += n }, nil)
+	}()
+	var got []byte
+	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+	for {
+		var hdr [4]byte
+		if _, err := io.ReadFull(client, hdr[:]); err != nil {
+			t.Fatalf("read header after %d bytes: %v", len(got), err)
+		}
+		piece := make([]byte, binary.BigEndian.Uint32(hdr[:]))
+		if _, err := io.ReadFull(client, piece); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, piece...)
+		if len(got) >= 40*300+200<<10 {
+			break
+		}
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-f.finish; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("bytes changed or reordered")
+	}
+	if accounted != int64(len(want)) {
+		t.Fatalf("accounted %d of %d", accounted, len(want))
+	}
+	if f.datas < 20 {
+		t.Fatalf("only %d small pieces went as Data (segments: %d)", f.datas, f.segs)
+	}
+	if f.segs == 0 {
+		t.Fatal("the large part did not go through segments")
+	}
+}

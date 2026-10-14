@@ -826,6 +826,8 @@ const (
 	spliceSegmentTarget = 250 * time.Millisecond
 	// 每交一段给内核之前,发送缓冲里未发出的字节最多这么多(再按段长放宽到两段),见 waitSendRoom。
 	spliceBacklogMin = 256 << 10
+	// 小于这么多字节的一段,入站支持 SpliceFramerData 时读进用户态交给它(交互式流量的小段)。
+	spliceSmall = 4 << 10
 )
 
 // spliceFramed 是给设了 session.SpliceFramer 的入站用的直通,目标读完返回 nil。
@@ -850,6 +852,8 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 	var broken error
 	defer func() { f.Finish(broken) }()
 	seg := int64(spliceSegmentMin)
+	small, _ := f.(session.SpliceFramerData)
+	var smallBuf []byte
 	for {
 		n, err := readableBytes(src)
 		if err == io.EOF {
@@ -857,6 +861,34 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 		}
 		if err != nil {
 			return err
+		}
+		if small != nil && n < spliceSmall {
+			// 这几个字节已经在内核里:读出来交给入站写成它自己的数据帧,省掉分段头 + 直通的几次系统调用
+			if smallBuf == nil {
+				smallBuf = make([]byte, spliceSmall)
+			}
+			k, rerr := src.Read(smallBuf[:n])
+			if k > 0 {
+				ok, werr := small.Data(smallBuf[:k])
+				if werr != nil {
+					broken = werr
+					return werr
+				}
+				if !ok {
+					return nil
+				}
+				account(int64(k))
+				if touch != nil {
+					touch()
+				}
+			}
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil
+				}
+				return rerr
+			}
+			continue
 		}
 		full := n >= seg // 这一段取满了:耗时反映的是往客户端写的速度,可以拿来调段长
 		if n > seg {

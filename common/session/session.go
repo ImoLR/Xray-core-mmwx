@@ -80,6 +80,13 @@ type SpliceFramer interface {
 	Finish(err error)
 }
 
+// SpliceFramerData 是 SpliceFramer 的可选扩展:很小的一段不值得走「分段头 + 直通」
+// (几次系统调用只搬几百字节),出站把它读进用户态交给入站,由入站按自己的格式写上连接。
+// 与 Segment 一样,返回 false 表示入站不要了(这条流被中止)。
+type SpliceFramerData interface {
+	Data(p []byte) (ok bool, err error)
+}
+
 // Outbound is the metadata of an outbound connection.
 type Outbound struct {
 	// Target address of the outbound connection.
