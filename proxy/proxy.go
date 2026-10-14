@@ -826,7 +826,11 @@ const spliceSegmentMax = 1 << 20
 //
 // 给 Finish 的 err 只在「某一段没写完」时非 nil;两段之间读源连接出的错(对端重置、本端取消)不算——
 // 那时连接上的分段仍是完整的,入站还能接着用这条连接。
-func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink func(), account func(int64)) error {
+//
+// touch 每搬完一段调一次(出站的活动计时器):上行结束后出站把超时改成 DownlinkOnly(线上 2 s),
+// 用户态路径每批数据都会喂它,这里以前不喂,下载搬到一半目标连接就被关、响应截断,
+// 通道也因为分段没写完而报废。喂了之后语义与用户态路径一致:下行静默满 DownlinkOnly 才断。
+func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink func(), account func(int64), touch func()) error {
 	if err := f.Handoff(closeLink); err != nil {
 		return err
 	}
@@ -860,6 +864,9 @@ func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink
 			return err
 		}
 		f.Written()
+		if touch != nil {
+			touch()
+		}
 	}
 }
 
@@ -928,7 +935,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				}
 			}
 			if f := inbound.SpliceFramer; f != nil {
-				return spliceFramed(tc, readerConn, f, func() { _ = common.Close(writer) }, account)
+				return spliceFramed(tc, readerConn, f, func() { _ = common.Close(writer) }, account, timer.Update)
 			}
 			err := spliceCopyAccounted(tc, readerConn, account)
 			if err != nil && errors.Cause(err) != io.EOF {

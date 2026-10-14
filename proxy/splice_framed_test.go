@@ -100,10 +100,11 @@ func TestSpliceFramed(t *testing.T) {
 
 	f := &testFramer{t: t, conn: inLocal, pending: head, finish: make(chan error, 1)}
 	var accounted int64
+	touches := 0
 	linkClosed := false
 	errc := make(chan error, 1)
 	go func() {
-		errc <- spliceFramed(inLocal, destLocal, f, func() { linkClosed = true }, func(n int64) { accounted += n })
+		errc <- spliceFramed(inLocal, destLocal, f, func() { linkClosed = true }, func(n int64) { accounted += n }, func() { touches++ })
 	}()
 
 	// 客户端:按「长度 · 数据」读,直到收够
@@ -138,6 +139,10 @@ func TestSpliceFramed(t *testing.T) {
 	if f.segs < 2 {
 		t.Fatalf("only %d segment(s)", f.segs)
 	}
+	// 每搬完一段都要喂一次出站的活动计时器,否则上行结束后 DownlinkOnly 会在搬运途中关掉目标连接
+	if touches != f.segs {
+		t.Fatalf("activity timer touched %d times for %d segments", touches, f.segs)
+	}
 
 	// 直通结束后入站还能在同一条连接上接着写(通道复用靠的就是这个)
 	if _, err := inLocal.Write([]byte{0, 0, 0, 3, 'e', 'n', 'd'}); err != nil {
@@ -157,7 +162,7 @@ func TestSpliceFramedSourceErrorBetweenSegments(t *testing.T) {
 
 	f := &testFramer{t: t, conn: inLocal, finish: make(chan error, 1)}
 	errc := make(chan error, 1)
-	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}) }()
+	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil) }()
 
 	_, _ = destRemote.Write(make([]byte, 100_000))
 	time.Sleep(100 * time.Millisecond) // 等这批搬完,循环停在「等下一批」上
@@ -188,7 +193,7 @@ func TestSpliceFramedStoppedByInbound(t *testing.T) {
 	}()
 	f := &testFramer{t: t, conn: inLocal, finish: make(chan error, 1), stopAfter: 3}
 	errc := make(chan error, 1)
-	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}) }()
+	go func() { errc <- spliceFramed(inLocal, destLocal, f, func() {}, func(int64) {}, nil) }()
 
 	// 读掉 Handoff 的头和 3 段,之后连接上不该再有任何字节
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
