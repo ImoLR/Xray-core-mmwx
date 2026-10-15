@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"os"
 	"strings"
 
 	"github.com/xtls/xray-core/app/log"
@@ -8,12 +9,29 @@ import (
 )
 
 func DefaultLogConfig() *log.Config {
-	return &log.Config{
+	config := &log.Config{
 		AccessLogType: log.LogType_None,
 		ErrorLogType:  log.LogType_Console,
 		ErrorLogLevel: clog.Severity_Warning,
 		// 配置里整段没有 log 时也走同一套默认,免得「有 log 段就不记 api、没有就记」这种不一致。
 		AccessExcludeInboundTags: defaultAccessExcludeInboundTags,
+	}
+	configureAccessLog(config, "")
+	return config
+}
+
+func configureAccessLog(config *log.Config, access string) {
+	config.AccessLogType = log.LogType_None
+	if access == "" {
+		access = os.Getenv("MMWXC_CORE_ACCESS_LOG")
+		if access == "console" {
+			config.AccessLogType = log.LogType_Console
+			return
+		}
+	}
+	if access != "" && access != "none" {
+		config.AccessLogPath = access
+		config.AccessLogType = log.LogType_File
 	}
 }
 
@@ -45,16 +63,11 @@ func (v *LogConfig) Build() *log.Config {
 	}
 	config := &log.Config{
 		ErrorLogType:  log.LogType_Console,
-		AccessLogType: log.LogType_Console,
+		AccessLogType: log.LogType_None,
 		EnableDnsLog:  v.DNSLog,
 	}
 
-	if v.AccessLog == "none" {
-		config.AccessLogType = log.LogType_None
-	} else if len(v.AccessLog) > 0 {
-		config.AccessLogPath = v.AccessLog
-		config.AccessLogType = log.LogType_File
-	}
+	configureAccessLog(config, v.AccessLog)
 	if v.ErrorLog == "none" {
 		config.ErrorLogType = log.LogType_None
 	} else if len(v.ErrorLog) > 0 {
