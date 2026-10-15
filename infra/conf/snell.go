@@ -1,6 +1,9 @@
 package conf
 
 import (
+	"net"
+	"strings"
+
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
@@ -19,8 +22,18 @@ type SnellUser struct {
 	Email    string `json:"email"`
 }
 
+// SnellShadowTLS 入站的 ShadowTLS v3 外壳(见 proxy/snell 的 ShadowTLSConfig)。
+type SnellShadowTLS struct {
+	Password string `json:"password"`
+	// Handshake 握手服务器,host 或 host:port(默认 443)。
+	Handshake string `json:"handshake"`
+	// Strict 只接受协商出 TLS 1.3 的握手服务器,默认 true。
+	Strict *bool `json:"strict"`
+}
+
 type SnellServerConfig struct {
-	Users []*SnellUser `json:"users"`
+	Users     []*SnellUser    `json:"users"`
+	ShadowTLS *SnellShadowTLS `json:"shadowTls"`
 }
 
 func (c *SnellServerConfig) Build() (proto.Message, error) {
@@ -44,7 +57,40 @@ func (c *SnellServerConfig) Build() (proto.Message, error) {
 			}),
 		})
 	}
+	if c.ShadowTLS != nil {
+		st, err := c.ShadowTLS.build(c.Users)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ShadowTls = st
+	}
 	return cfg, nil
+}
+
+func (c *SnellShadowTLS) build(users []*SnellUser) (*snell.ShadowTLSConfig, error) {
+	if c.Password == "" {
+		return nil, errors.New("SNELL: shadowTls.password is required")
+	}
+	host := strings.TrimSpace(c.Handshake)
+	if host == "" {
+		return nil, errors.New("SNELL: shadowTls.handshake is required")
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(host, "443")
+	}
+	for _, u := range users {
+		if u.Version == 6 {
+			return nil, errors.New("SNELL: shadowTls only supports snell v4/v5")
+		}
+		if m := strings.ToLower(u.ObfsMode); m != "" && m != "none" {
+			return nil, errors.New("SNELL: shadowTls cannot be combined with obfs ", u.ObfsMode)
+		}
+	}
+	strict := true
+	if c.Strict != nil {
+		strict = *c.Strict
+	}
+	return &snell.ShadowTLSConfig{Password: c.Password, Handshake: host, Strict: strict}, nil
 }
 
 type SnellClientConfig struct {
