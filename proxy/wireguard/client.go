@@ -116,6 +116,12 @@ func NewClient(ctx context.Context, conf *DeviceConfig) (*Handler, error) {
 	if !conf.NoKernelTun && kernelTunSupported {
 		errors.LogWarning(context.Background(), "Using kernel TUN")
 		tun, tnet, err = createKernelTun(localAddresses, dnses, int(conf.Mtu))
+		if err != nil {
+			// 内核 TUN 建不起来(没有 tun 模块、设备节点不可用……)就退回 gVisor:
+			// 设备在创建出站时就建,不退的话一个 WireGuard 出站会让整个 xray 起不来。
+			errors.LogWarningInner(context.Background(), err, "Failed to create kernel TUN, falling back to gVisor TUN")
+			tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)
+		}
 	} else {
 		errors.LogWarning(context.Background(), "Using gVisor TUN")
 		tun, tnet, _, err = CreateNetTUN(localAddresses, dnses, int(conf.Mtu), true)

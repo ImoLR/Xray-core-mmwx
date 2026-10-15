@@ -264,7 +264,15 @@ func (tun *kernelTun) DialUDPAddrPort(laddr, raddr netip.AddrPort) (net.Conn, er
 	}, nil
 }
 
+// kernelTunDevicePath 内核 TUN 设备节点(测试里替换)。
+var kernelTunDevicePath = "/dev/net/tun"
+
 func KernelTunSupported() (bool, error) {
+	// 只看 CAP_NET_ADMIN 不够:LXC / OpenVZ 容器里 root 有这个权限,却没有 /dev/net/tun,
+	// 选了内核 TUN 必然建不起来。上游合并后设备在创建出站时就建,建失败整个 xray 起不来。
+	if _, err := os.Stat(kernelTunDevicePath); err != nil {
+		return false, nil
+	}
 	var hdr unix.CapUserHeader
 	hdr.Version = unix.LINUX_CAPABILITY_VERSION_3
 	hdr.Pid = 0 // 0 means current process
