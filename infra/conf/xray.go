@@ -345,8 +345,11 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	if err != nil {
 		return nil, errors.New("failed to build outbound handler for protocol ", c.Protocol).Base(err)
 	}
+	// mmwx:官方 #6303 把「公网地址上不加密的 VLESS / Trojan 出站」当成配置错误,整份配置都加载不了。
+	// 面板的中转 / 路由出站本来就会连到用户自己的明文 VLESS 落地,这一条拒绝会让整台 xray 起不来,
+	// 所以这里只打警告、照常加载。
 	if err := validateOutboundTransportSecurity(rawConfig, senderSettings); err != nil {
-		return nil, err
+		errors.LogWarning(context.Background(), "outbound ", c.Tag, ": ", err.Error())
 	}
 
 	if _, ok := ts.(*masque.ClientConfig); !ok && senderSettings.StreamSettings != nil && senderSettings.StreamSettings.ProtocolName == "masque" {
