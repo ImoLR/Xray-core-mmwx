@@ -188,3 +188,33 @@ func TestSnapshotJSONUsesNullForUnlimited(t *testing.T) {
 		}
 	}
 }
+
+func TestControlServerFeatures(t *testing.T) {
+	server := newControlServer(NewManager())
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/features", nil))
+	var body struct {
+		Features []string `json:"features"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &body) != nil {
+		t.Fatalf("features response = %d %s", response.Code, response.Body.String())
+	}
+	want := map[string]bool{"anytls.downlink_stats": true, "snell.udp_per_packet_target": true}
+	for _, f := range body.Features {
+		delete(want, f)
+	}
+	if len(want) != 0 {
+		t.Fatalf("features %v miss %v", body.Features, want)
+	}
+	// The snapshot is strictly decoded by every released Helper: it must not change.
+	response = httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/snapshot", nil))
+	if bytes.Contains(response.Body.Bytes(), []byte("features")) || !bytes.Contains(response.Body.Bytes(), []byte(`"version":7`)) {
+		t.Fatalf("snapshot changed: %s", response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/features", nil))
+	if response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST features = %d", response.Code)
+	}
+}

@@ -27,6 +27,13 @@ type controlSnapshot struct {
 	ManagementGroups []ManagementGroupSnapshot `json:"management_groups"`
 }
 
+// ControlFeatures names behaviour fixes a Helper may gate on, served by
+// /v1/features. Additive only: older Helpers never request it, and the
+// snapshot (strictly decoded by every Helper) stays at version 7.
+//   - anytls.downlink_stats: AnyTLS server writes reach the inbound counter.
+//   - snell.udp_per_packet_target: every Snell UDP datagram reaches its own target.
+var ControlFeatures = []string{"anytls.downlink_stats", "snell.udp_per_packet_target"}
+
 var controlRuntime struct {
 	sync.Mutex
 	path string
@@ -107,6 +114,13 @@ func newControlServer(manager *Manager) *http.Server {
 			return
 		}
 		writeControlJSON(w, http.StatusOK, controlSnapshot{Version: 7, StartedAt: startedAt, Global: global, Inbounds: manager.ConfiguredInbounds(), Users: users, ManagementGroups: groups})
+	})
+	mux.HandleFunc("/v1/features", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		writeControlJSON(w, http.StatusOK, map[string]any{"features": ControlFeatures})
 	})
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {
