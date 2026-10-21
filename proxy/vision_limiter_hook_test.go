@@ -115,8 +115,9 @@ func TestVisionReaderHookOnlyOnClientSide(t *testing.T) {
 			once := append([]byte(nil), uuid...)
 			padded := XtlsPadding(content, CommandPaddingDirect, &once, false, ctx, []uint32{900, 500, 900, 256})
 
+			rawInput := new(bytes.Buffer)
 			r := NewVisionReader(&onceReader{mb: buf.MultiBuffer{padded}}, state, tc.isUplink, ctx, sinkConn{},
-				bytes.NewReader(nil), new(bytes.Buffer), nil)
+				bytes.NewReader(nil), &rawInput, nil)
 			mb, err := r.ReadMultiBuffer()
 			if err != nil {
 				t.Fatalf("ReadMultiBuffer: %v", err)

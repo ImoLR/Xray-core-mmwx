@@ -1,13 +1,15 @@
-# MMWX 对 github.com/xtls/reality v0.0.0-20260908062103-8cdf7bf9c7f0 的补丁
+# MMWX 对 github.com/xtls/reality v0.0.0-20261014101318-83f621788ca8 的补丁
 
-版本锁在 v26.10.10 用的这一版,**不要**跟官方 main 升到 20261014101318:那一版把 `Conn.rawInput` 从
-`bytes.Buffer` 改成了 `*bytes.Buffer`(空闲时还给池子),而 xray 的 XTLS Vision(proxy/vless/inbound、proxy/proxy.go)
-仍按值去取这个字段(reflect + unsafe),REALITY + Vision 一有数据就 SIGSEGV / 读到垃圾长度把内存吃光
-(2026-10-14 在测试机 AgentB 上实测:agent 先崩、再被 OOM 杀)。等官方 xray 把 Vision 的取法跟上再一起升。
+与官方 Xray-core v26.10.21 用的是同一版。这一版跟上了 Go 1.27 的 crypto/tls(此前的 20260908 停在 2025-05 的 Go 开发版,
+缺 CVE-2025-61730 / CVE-2026-32283 / CVE-2026-56862 / CVE-2025-58189 的修复)。
+
+`Conn.rawInput` 在这一版是 `*bytes.Buffer`:XTLS Vision 从 v26.10.21 起用 `vless.AccessTLSBuffers` 按字段类型取,
+两种布局都认。2026-10-14 曾因 Vision 还按值读而 SIGSEGV(AgentB 实测先崩再被 OOM 杀),所以当时锁在 20260908 ——
+升这个目录前先确认 Vision 的取法能认新布局(`proxy/vless/inbound/vision_layout_test.go`)。
 
 补丁只改 `tls.go` 的 `Server()` 里挑 key share 的一段(搜 `MMWX:`)。
 
-上游从这一版起拒绝**不带 X25519MLKEM768 的 Client Hello**(「reject outdated/strange Client Hello」)。
+上游从 20260908 起拒绝**不带 X25519MLKEM768 的 Client Hello**(「reject outdated/strange Client Hello」)。
 而 mihomo(到 2026-10-12 的上游版本都是)默认在 REALITY 里把 X25519MLKEM768 去掉,只有 `reality-opts` 里显式写
 `support-x25519mlkem768: true` 才带 —— 照上游的服务端,基于 mihomo 的客户端(Clash Verge、FlClash、MeowX Android /
 Windows 等)连 REALITY 节点一律失败(客户端报 `REALITY authentication failed`)。
