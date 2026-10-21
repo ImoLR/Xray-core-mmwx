@@ -322,10 +322,46 @@ func validateXDrive(ts proto.Message, ss *internet.StreamConfig, ms *proxyman.Mu
 	return nil
 }
 
+// mmwx:官方 v26.10.10 起出站的 "proxySettings" 直接报错(已迁到 streamSettings.sockopt.dialerProxy),
+// 整份配置都加载不了。用户以前手写 / 老版本留下的链式出站(如 warp-out 走另一个出站)在 agent 升级后
+// 整台 xray 起不来(用户实报:中转到落地的节点全部失效)。这里把 proxySettings.tag 换成 dialerProxy、
+// 只打警告照常加载;两个都写了且不一致时以 dialerProxy 为准(官方以前也是只警告)。
+func (c *OutboundDetourConfig) migrateProxySettings() error {
+	var ps struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.Unmarshal(*c.ProxySettings, &ps); err != nil {
+		return errors.New(`outbound "proxySettings" is not a valid JSON object`).Base(err)
+	}
+	c.ProxySettings = nil
+	tag := strings.TrimSpace(ps.Tag)
+	if tag == "" {
+		errors.LogWarning(context.Background(), "outbound ", c.Tag, `: ignoring empty "proxySettings"`)
+		return nil
+	}
+	if c.StreamSetting == nil {
+		c.StreamSetting = &StreamConfig{}
+	}
+	if c.StreamSetting.SocketSettings == nil {
+		c.StreamSetting.SocketSettings = &SocketConfig{}
+	}
+	switch cur := c.StreamSetting.SocketSettings.DialerProxy; {
+	case cur == "":
+		c.StreamSetting.SocketSettings.DialerProxy = tag
+	case cur != tag:
+		errors.LogWarning(context.Background(), "outbound ", c.Tag, `: "proxySettings.tag" (`, tag, `) conflicts with "sockopt.dialerProxy" (`, cur, `), using dialerProxy`)
+		return nil
+	}
+	errors.LogWarning(context.Background(), "outbound ", c.Tag, `: "proxySettings" was removed upstream, loaded as "streamSettings.sockopt.dialerProxy": "`, tag, `"; please update the config`)
+	return nil
+}
+
 // Build implements Buildable.
 func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	if c.ProxySettings != nil {
-		return nil, errors.PrintRemovedFeatureError(`outbound "proxySettings"`, `"streamSettings.sockopt.dialerProxy"`)
+		if err := c.migrateProxySettings(); err != nil {
+			return nil, err
+		}
 	}
 
 	senderSettings := &proxyman.SenderConfig{}
