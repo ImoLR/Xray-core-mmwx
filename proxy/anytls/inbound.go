@@ -59,12 +59,14 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 	sessPol := s.policyManager.ForLevel(0)
 	_ = conn.SetReadDeadline(time.Now().Add(sessPol.Timeouts.Handshake))
 
+	// bw 经 conn 本身(inbound 的 stat.CounterConnection)写:buf.NewWriter 会拆掉计数连接,
+	// BufferedWriter 刷新时直接写裸连接,下行字节一个都进不了入站计数(下载不计费)。
 	sess := &session{
 		isClient:   false,
 		server:     s,
 		conn:       conn,
 		br:         &buf.BufferedReader{Reader: buf.NewReader(conn)},
-		bw:         buf.NewBufferedWriter(buf.NewWriter(conn)),
+		bw:         buf.NewBufferedWriter(&buf.SequentialWriter{Writer: conn}),
 		streams:    make(map[uint32]*stream),
 		dispatcher: dispatcher,
 	}
