@@ -172,25 +172,28 @@ func (o *Observer) probe(outbound string) ProbeResult {
 		Timeout: time.Second * 5,
 	}
 	var GETTime time.Duration
-	err := task.Run(o.ctx, func() error {
-		startTime := time.Now()
-		probeURL := "https://www.google.com/generate_204"
-		if o.config.ProbeUrl != "" {
-			probeURL = o.config.ProbeUrl
+	var err error
+	// 配置的探测地址不通时再试 Cloudflare 的 204(见 FallbackProbeURL),任一个通就算活着。
+	for _, probeURL := range ProbeURLs(o.config.ProbeUrl, "https://www.google.com/generate_204") {
+		err = task.Run(o.ctx, func() error {
+			startTime := time.Now()
+			req, _ := http.NewRequest(http.MethodGet, probeURL, nil)
+			utils.TryDefaultHeadersWith(req.Header, "nav")
+			response, err := httpClient.Do(req)
+			if err != nil {
+				return errors.New("outbound failed to relay connection").Base(err)
+			}
+			if response.Body != nil {
+				response.Body.Close()
+			}
+			endTime := time.Now()
+			GETTime = endTime.Sub(startTime)
+			return nil
+		})
+		if err == nil {
+			break
 		}
-		req, _ := http.NewRequest(http.MethodGet, probeURL, nil)
-		utils.TryDefaultHeadersWith(req.Header, "nav")
-		response, err := httpClient.Do(req)
-		if err != nil {
-			return errors.New("outbound failed to relay connection").Base(err)
-		}
-		if response.Body != nil {
-			response.Body.Close()
-		}
-		endTime := time.Now()
-		GETTime = endTime.Sub(startTime)
-		return nil
-	})
+	}
 	if err != nil {
 		errorMessage := "the outbound " + outbound + " is dead: GET request failed:" + err.Error() + "with outbound handler report underlying connection failed"
 		errors.LogInfoInner(o.ctx, errorCollectorForRequest.UnderlyingError(), errorMessage)
