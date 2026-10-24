@@ -63,7 +63,10 @@ func (c *Commander) Type() interface{} {
 // Start implements common.Runnable.
 func (c *Commander) Start() error {
 	c.Lock()
-	c.server = grpc.NewServer()
+	// api adrules sends geo data inlined (main/commands/all/api/rules_add.go);
+	// the Helper caps a plan at 3 MiB of geo files, about 4 MiB once encoded,
+	// right at gRPC's default 4 MiB per message. The API listens locally.
+	c.server = grpc.NewServer(grpc.MaxRecvMsgSize(16 << 20))
 	for _, service := range c.services {
 		service.Register(c.server)
 	}
