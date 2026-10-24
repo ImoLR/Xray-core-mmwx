@@ -2,6 +2,8 @@ module github.com/xtls/xray-core
 
 go 1.27
 
+toolchain go1.27.3
+
 require (
 	github.com/apernet/quic-go v0.61.1-0.20260806010916-184d081eef3e
 	github.com/cloudflare/circl v1.6.5
