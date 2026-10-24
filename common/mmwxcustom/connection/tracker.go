@@ -1589,6 +1589,9 @@ func (m *Manager) Snapshots() []Snapshot {
 // TrackDial wraps the single physical TCP dial selected by Xray. UDP bypasses
 // accounting and limits. A failed dial always releases its reservation.
 func TrackDial(ctx context.Context, destination xnet.Destination, dial func() (stdnet.Conn, error)) (stdnet.Conn, error) {
+	if guardHopContext(ctx) {
+		return dial()
+	}
 	lease, err := Default.acquire(ctx, destination)
 	if err != nil {
 		return nil, err
@@ -1623,6 +1626,15 @@ func TrackInbound(conn stdnet.Conn) stdnet.Conn {
 	return &trackedInboundConn{Conn: conn, manager: Default, tuple: tuple}
 }
 
+// TrackInboundFor tracks a connection accepted by the inbound with the given
+// tag, except the Reality guard's own loopback hop (guard_hop.go).
+func TrackInboundFor(tag string, conn stdnet.Conn) stdnet.Conn {
+	if conn == nil || guardHopConn(tag, conn) {
+		return conn
+	}
+	return TrackInbound(conn)
+}
+
 // UnwrapInbound exposes the transport for protocol inspection and raw copy.
 // The session must retain and close the tracked connection to release ownership.
 func (c *trackedInboundConn) UnwrapInbound() stdnet.Conn {
@@ -1650,6 +1662,9 @@ func BindInbound(ctx context.Context, conn stdnet.Conn) error {
 // released when the per-request context ends, so Mux streams are counted as
 // independent logical connections rather than as one physical socket.
 func AdmitInbound(ctx context.Context) error {
+	if guardHopContext(ctx) {
+		return nil
+	}
 	lease, err := Default.admitInbound(identityFromContext(ctx), sourceFromContext(ctx))
 	if err != nil || lease == nil {
 		return err

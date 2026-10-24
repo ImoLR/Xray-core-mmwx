@@ -102,7 +102,7 @@ func (w *tcpWorker) callback(conn stat.Connection) {
 	}
 	ctx = session.ContextWithOutbounds(ctx, outbounds)
 
-	conn = customconnection.TrackInbound(conn)
+	conn = customconnection.TrackInboundFor(w.tag, conn)
 	if w.uplinkCounter != nil || w.downlinkCounter != nil {
 		conn = &stat.CounterConnection{
 			Connection:   conn,

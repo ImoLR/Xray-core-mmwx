@@ -32,7 +32,9 @@ type controlSnapshot struct {
 // snapshot (strictly decoded by every Helper) stays at version 7.
 //   - anytls.downlink_stats: AnyTLS server writes reach the inbound counter.
 //   - snell.udp_per_packet_target: every Snell UDP datagram reaches its own target.
-var ControlFeatures = []string{"anytls.downlink_stats", "snell.udp_per_packet_target"}
+//   - flvx.reality_guard_hop_uncounted: the Reality guard's loopback hop is not
+//     tracked, so a guarded connection counts like an unguarded one (guard_hop.go).
+var ControlFeatures = []string{"anytls.downlink_stats", "snell.udp_per_packet_target", GuardHopFeature}
 
 var controlRuntime struct {
 	sync.Mutex
