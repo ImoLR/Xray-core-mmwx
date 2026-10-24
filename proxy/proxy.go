@@ -13,10 +13,12 @@ import (
 	"math/big"
 	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/pires/go-proxyproto"
 	"github.com/xtls/xray-core/app/dispatcher"
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
@@ -180,14 +182,14 @@ type VisionReader struct {
 	isUplink     bool
 	conn         net.Conn
 	input        *bytes.Reader
-	rawInput     *bytes.Buffer
+	rawInput     **bytes.Buffer
 	ob           *session.Outbound
 
 	// internal
 	directReadCounter stats.Counter
 }
 
-func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput *bytes.Buffer, ob *session.Outbound) *VisionReader {
+func NewVisionReader(reader buf.Reader, trafficState *TrafficState, isUplink bool, ctx context.Context, conn net.Conn, input *bytes.Reader, rawInput **bytes.Buffer, ob *session.Outbound) *VisionReader {
 	return &VisionReader{
 		Reader:       reader,
 		trafficState: trafficState,
@@ -261,12 +263,15 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		if inputBuffer, err := buf.ReadFrom(w.input); err == nil && !inputBuffer.IsEmpty() {
 			buffer, _ = buf.MergeMulti(buffer, inputBuffer)
 		}
-		if rawInputBuffer, err := buf.ReadFrom(w.rawInput); err == nil && !rawInputBuffer.IsEmpty() {
-			buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
-		}
 		*w.input = bytes.Reader{} // release memory
 		w.input = nil
-		*w.rawInput = bytes.Buffer{} // release memory
+
+		if raw := *w.rawInput; raw != nil {
+			if rawInputBuffer, err := buf.ReadFrom(raw); err == nil && !rawInputBuffer.IsEmpty() {
+				buffer, _ = buf.MergeMulti(buffer, rawInputBuffer)
+			}
+			// *raw = bytes.Buffer{} // may not be suitable for Go 1.27.3+
+		}
 		w.rawInput = nil
 
 		if inbound := session.InboundFromContext(w.ctx); inbound != nil && inbound.Conn != nil {
@@ -277,6 +282,7 @@ func (w *VisionReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 				w.ob.CanSpliceCopy = 1
 			}
 		}
+		SuppressOuterCloseNotify(w.conn)
 		readerConn, readCounter, _, observeEOF := unwrapRawConn(w.conn)
 		// 给 mmw-agent 这类下游一次包装底层 conn 的机会(per-user 限速),
 		// 未注册 hook 时原样返回,无开销。详见 vision_limiter_hook.go。
@@ -348,6 +354,7 @@ func (w *VisionWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 			// 	w.ob.CanSpliceCopy = 1
 			// }
 		}
+		SuppressOuterCloseNotify(w.conn)
 		rawConn, _, writerCounter := UnwrapRawConn(w.conn)
 		// 同 Reader 路径,给下游 per-user 限速钩子一次机会包装底层 conn。
 		// !isUplink 的 Writer 写的是客户端连接(入站侧);isUplink 的是出站侧写往落地服务器。
@@ -733,6 +740,19 @@ func XtlsFilterTls(buffer buf.MultiBuffer, trafficState *TrafficState, ctx conte
 	}
 }
 
+type CloseNotifySuppressor interface {
+	SuppressCloseNotify()
+}
+
+// Close our local TLS conn instance might send a incorrect close_notify alert
+// if the XTLS direct copy mode is enabled and cause TLS BAD_RECORD_MAC on users' browser
+// Close the underlying connection directly to avoid this issue.
+func SuppressOuterCloseNotify(conn net.Conn) {
+	if suppressor, ok := stat.TryUnwrapStatsConn(conn).(CloseNotifySuppressor); ok {
+		suppressor.SuppressCloseNotify()
+	}
+}
+
 // UnwrapRawConn support unwrap encryption, stats, mask wrappers, tls, utls, reality, proxyproto, uds-wrapper conn and get raw tcp/uds conn from it
 func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 	raw, readCounter, writeCounter, _ := unwrapRawConn(conn)
@@ -849,21 +869,26 @@ const (
 // 「长期为 0、偶尔一大坨」,正是要治的病。夹住之后,一次瞬时尖峰最多让段翻倍,
 // 几段之内就自我校正回稳态,记账间隔始终维持在半秒量级。
 func nextSpliceChunk(cur, n int64, took time.Duration) int64 {
+	return proportionalChunk(cur, n, took, spliceAccountTarget, spliceAccountChunkMin, spliceAccountChunk)
+}
+
+// proportionalChunk 是 nextSpliceChunk 的通用版:目标耗时与上下限由调用方给。
+func proportionalChunk(cur, n int64, took, target time.Duration, lo, hi int64) int64 {
 	if n <= 0 || took <= 0 {
 		return cur
 	}
-	want := int64(float64(cur) * float64(spliceAccountTarget) / float64(took))
+	want := int64(float64(cur) * float64(target) / float64(took))
 	if want > cur*2 {
 		want = cur * 2
 	}
 	if want < cur/2 {
 		want = cur / 2
 	}
-	if want > spliceAccountChunk {
-		want = spliceAccountChunk
+	if want > hi {
+		want = hi
 	}
-	if want < spliceAccountChunkMin {
-		want = spliceAccountChunkMin
+	if want < lo {
+		want = lo
 	}
 	return want
 }
@@ -886,6 +911,132 @@ func spliceCopyAccounted(dst io.Writer, src io.Reader, account func(int64)) erro
 			return err
 		}
 		chunk = nextSpliceChunk(chunk, n, time.Since(start))
+	}
+}
+
+// 分段直通的段长:按实测速率自适应,每段目标耗时 spliceSegmentTarget,夹在 [spliceSegmentMin, spliceSegmentMax]。
+// 入站中止一条流时要等当前这一段搬完才能收尾(见 SpliceFramer),段长固定 1 MiB 时,慢链路上一段就要好几秒,
+// 客户端等不到收尾只好把整条连接关掉,还白收一整段。按速率收段长之后,中止的等待不超过约一个目标耗时。
+const (
+	spliceSegmentMax    = 1 << 20
+	spliceSegmentMin    = 64 << 10
+	spliceSegmentTarget = 250 * time.Millisecond
+	// 每交一段给内核之前,发送缓冲里未发出的字节最多这么多(再按段长放宽到两段),见 waitSendRoom。
+	spliceBacklogMin = 256 << 10
+	// 小于这么多字节的一段,入站支持 SpliceFramerData 时读进用户态交给它(交互式流量的小段)。
+	spliceSmall = 4 << 10
+)
+
+// spliceFramed 是给设了 session.SpliceFramer 的入站用的直通,目标读完返回 nil。
+//
+// 每一段先问清源连接的接收缓冲里现在有多少字节,把这个数告诉入站(它据此在连接上写分段头),
+// 再把恰好这么多字节搬过去——它们已经在内核里,声明了就一定搬得完,不会卡在半段上。
+// 每段搬完就记账,所以统计的滞后不超过一段。
+//
+// 分段头和这一段的数据之间塞住发送(TCP_CORK):否则入站那条几十字节的分段头会单独占一个包,
+// 小段(交互式流量)的包数直接翻倍。
+//
+// 给 Finish 的 err 只在「某一段没写完」时非 nil;两段之间读源连接出的错(对端重置、本端取消)不算——
+// 那时连接上的分段仍是完整的,入站还能接着用这条连接。
+//
+// touch 每搬完一段调一次(出站的活动计时器):上行结束后出站把超时改成 DownlinkOnly(线上 2 s),
+// 用户态路径每批数据都会喂它,这里以前不喂,下载搬到一半目标连接就被关、响应截断,
+// 通道也因为分段没写完而报废。喂了之后语义与用户态路径一致:下行静默满 DownlinkOnly 才断。
+//
+// gate 非 nil 时每段之前问它能搬多少(见 session.Inbound.SpliceGate),等令牌期间照样喂活动计时器。
+func spliceFramed(dst io.Writer, src net.Conn, f session.SpliceFramer, closeLink func(), account func(int64), touch func(), gate func(int64) int64) error {
+	if err := f.Handoff(closeLink); err != nil {
+		return err
+	}
+	var broken error
+	defer func() { f.Finish(broken) }()
+	seg := int64(spliceSegmentMin)
+	small, _ := f.(session.SpliceFramerData)
+	var smallBuf []byte
+	for {
+		n, err := readableBytes(src)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if small != nil && n < spliceSmall {
+			// 这几个字节已经在内核里:读出来交给入站写成它自己的数据帧,省掉分段头 + 直通的几次系统调用
+			if smallBuf == nil {
+				smallBuf = make([]byte, spliceSmall)
+			}
+			k, rerr := src.Read(smallBuf[:n])
+			if k > 0 {
+				ok, werr := small.Data(smallBuf[:k])
+				if werr != nil {
+					broken = werr
+					return werr
+				}
+				if !ok {
+					return nil
+				}
+				account(int64(k))
+				if touch != nil {
+					touch()
+				}
+			}
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil
+				}
+				return rerr
+			}
+			continue
+		}
+		full := n >= seg // 这一段取满了:耗时反映的是往客户端写的速度,可以拿来调段长
+		if n > seg {
+			n = seg
+		}
+		if gate != nil {
+			if touch != nil {
+				touch()
+			}
+			allowed := gate(n)
+			if allowed <= 0 {
+				return nil // 不搬了(请求结束 / 被踢):停在两段之间,连接上的分段是完整的
+			}
+			if allowed < n {
+				n, full = allowed, false
+			}
+			if touch != nil {
+				touch()
+			}
+		}
+		// 发送缓冲里积压的未发数据先降下来再交下一段:积压都排在中止后的 END 前面。
+		// 计时从这里起:稳态下「等积压降下来 + 拷进内核」才是一段真正送出去的耗时;只计拷贝的话,
+		// 发送缓冲有空时拷贝几乎瞬间完成,段长会一路涨到上限,积压上限也跟着放宽,把关形同虚设。
+		start := time.Now()
+		waitSendRoom(dst, max(spliceBacklogMin, int(2*seg)))
+		setCork(dst, true)
+		ok, err := f.Segment(n)
+		if err != nil || !ok {
+			setCork(dst, false)
+			broken = err // 分段头没写出去:连接已经不能用了;入站叫停则是 nil
+			return err
+		}
+		w, err := io.CopyN(dst, src, n)
+		took := time.Since(start)
+		setCork(dst, false)
+		if w > 0 {
+			account(w)
+		}
+		if err != nil {
+			broken = err
+			return err
+		}
+		f.Written()
+		if full {
+			seg = proportionalChunk(seg, w, took, spliceSegmentTarget, spliceSegmentMin, spliceSegmentMax)
+		}
+		if touch != nil {
+			touch()
+		}
 	}
 }
 
@@ -918,6 +1069,10 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	if inbound == nil || inbound.CanSpliceCopy == 3 {
 		return readV(ctx, reader, writer, timer, readCounter)
 	}
+	// 分段直通要先知道源连接里有多少字节可读,拿不到 fd 的连接做不了。
+	if _, ok := readerConn.(syscall.Conn); inbound.SpliceFramer != nil && !ok {
+		return readV(ctx, reader, writer, timer, readCounter)
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		return readV(ctx, reader, writer, timer, readCounter)
@@ -931,7 +1086,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 	for {
 		inbound := session.InboundFromContext(ctx)
 		outbounds := session.OutboundsFromContext(ctx)
-		var splice = inbound.CanSpliceCopy == 1
+		splice := inbound.CanSpliceCopy == 1
 		for _, ob := range outbounds {
 			if ob.CanSpliceCopy != 1 {
 				splice = false
@@ -952,7 +1107,7 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 			// 于是一条长连接(大文件下载 / 视频 / BT)可以跑掉几十 GB 而流量额度那侧
 			// 一动不动,超额判定要等这条连接断了才看得见 —— 用户实报「超了几十个 G
 			// 才被移除访问权限」。同类问题见 0404f82b(SS2022 关闭后计数滞后 300 秒)。
-			err := spliceCopyAccounted(tc, readerConn, func(n int64) {
+			account := func(n int64) {
 				if readCounter != nil {
 					readCounter.Add(n) // outbound stats
 				}
@@ -962,7 +1117,11 @@ func CopyRawConnIfExist(ctx context.Context, readerConn net.Conn, writerConn net
 				if statWriter != nil {
 					statWriter.Counter.Add(n) // user stats
 				}
-			})
+			}
+			if f := inbound.SpliceFramer; f != nil {
+				return spliceFramed(tc, readerConn, f, func() { _ = common.Close(writer) }, account, timer.Update, inbound.SpliceGate)
+			}
+			err := spliceCopyAccounted(tc, readerConn, account)
 			if err != nil && errors.Cause(err) != io.EOF {
 				return err
 			}

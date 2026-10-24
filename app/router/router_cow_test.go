@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/geodata"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -123,6 +124,6 @@ func TestRouterReloadDoesNotLoseAlwaysPresentRule(t *testing.T) {
 func ruleForDomain(tag, domain string) *RoutingRule {
 	return &RoutingRule{
 		TargetTag: &RoutingRule_Tag{Tag: tag},
-		Domain:    []*Domain{{Type: Domain_Full, Value: domain}},
+		Domain:    []*geodata.DomainRule{{Value: &geodata.DomainRule_Custom{Custom: &geodata.Domain{Type: geodata.Domain_Full, Value: domain}}}},
 	}
 }

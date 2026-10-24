@@ -31,7 +31,6 @@ const (
 	CipherType_AES_256_GCM        CipherType = 6
 	CipherType_CHACHA20_POLY1305  CipherType = 7
 	CipherType_XCHACHA20_POLY1305 CipherType = 8
-	CipherType_NONE               CipherType = 9
 )
 
 // Enum value maps for CipherType.
@@ -42,7 +41,6 @@ var (
 		6: "AES_256_GCM",
 		7: "CHACHA20_POLY1305",
 		8: "XCHACHA20_POLY1305",
-		9: "NONE",
 	}
 	CipherType_value = map[string]int32{
 		"UNKNOWN":            0,
@@ -50,7 +48,6 @@ var (
 		"AES_256_GCM":        6,
 		"CHACHA20_POLY1305":  7,
 		"XCHACHA20_POLY1305": 8,
-		"NONE":               9,
 	}
 )
 
@@ -270,15 +267,14 @@ const file_proxy_shadowsocks_config_proto_rawDesc = "" +
 	"\tobfs_mode\x18\x03 \x01(\tR\bobfsMode\x12\x1b\n" +
 	"\tobfs_host\x18\x04 \x01(\tR\bobfsHost\"L\n" +
 	"\fClientConfig\x12<\n" +
-	"\x06server\x18\x01 \x01(\v2$.xray.common.protocol.ServerEndpointR\x06server*t\n" +
+	"\x06server\x18\x01 \x01(\v2$.xray.common.protocol.ServerEndpointR\x06server*j\n" +
 	"\n" +
 	"CipherType\x12\v\n" +
 	"\aUNKNOWN\x10\x00\x12\x0f\n" +
 	"\vAES_128_GCM\x10\x05\x12\x0f\n" +
 	"\vAES_256_GCM\x10\x06\x12\x15\n" +
 	"\x11CHACHA20_POLY1305\x10\a\x12\x16\n" +
-	"\x12XCHACHA20_POLY1305\x10\b\x12\b\n" +
-	"\x04NONE\x10\tBd\n" +
+	"\x12XCHACHA20_POLY1305\x10\bBd\n" +
 	"\x1acom.xray.proxy.shadowsocksP\x01Z+github.com/xtls/xray-core/proxy/shadowsocks\xaa\x02\x16Xray.Proxy.Shadowsocksb\x06proto3"
 
 var (

@@ -24,8 +24,18 @@ message Account {
   string client_id = 6;
 }
 
+// ShadowTLS v3 外壳(仅 v4/v5,与 obfs 互斥):客户端先跟握手服务器完成一次真实 TLS 握手,
+// 之后的 Snell 数据装在 ApplicationData 记录里。认不出的连接整条转发给握手服务器。
+message ShadowTLSConfig {
+  string password = 1;
+  // 握手服务器 host:port,须支持 TLS 1.3(strict 时)。
+  string handshake = 2;
+  bool strict = 3;
+}
+
 message ServerConfig {
   repeated xray.common.protocol.User users = 1;
+  ShadowTLSConfig shadow_tls = 2;
 }
 
 message ClientConfig {

@@ -3,26 +3,42 @@ package wireguard
 import (
 	"context"
 	"encoding/hex"
-	"errors"
-	"net"
 	"net/netip"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
-	"golang.zx2c4.com/wireguard/conn"
+	"golang.org/x/crypto/curve25519"
 )
 
 func pubHex(b byte) string {
 	return strings.Repeat(string("0123456789abcdef"[b&0xf]), 64)
 }
 
-func newTestServer(t *testing.T, conf *DeviceConfig) (*Server, error) {
+// newTestServer 只装用户表、不建设备,走的是 NewServer 里同一个 collectDeviceUsers。
+// peers 是旧形态的匿名 peer,合并上游后在 infra/conf 里就被建成 email 为空的用户,这里照此拼接。
+func newTestServer(t *testing.T, conf *DeviceConfig, peers ...*PeerConfig) (*Server, error) {
 	t.Helper()
 	s := &Server{conf: conf, users: new(sync.Map)}
-	return s, s.loadUsers(conf)
+	all, err := collectDeviceUsers(append(conf.Users, anonymous(peers)...))
+	if err != nil {
+		return s, err
+	}
+	for _, u := range all {
+		s.users.Store(u.Account.(*MemoryAccount).Pub, u)
+	}
+	return s, nil
+}
+
+func anonymous(peers []*PeerConfig) []*protocol.User {
+	var out []*protocol.User
+	for _, p := range peers {
+		out = append(out, named("", p))
+	}
+	return out
 }
 
 func named(email string, p *PeerConfig) *protocol.User {
@@ -107,13 +123,8 @@ func TestLoadUsersRejectsNonCanonicalPrefix(t *testing.T) {
 // 纯旧配置(只有匿名 peers)必须原样工作:它本来就没有用户身份,
 // 0.0.0.0/0 是合法且常见的,不能被本次改动判成非法。
 func TestLoadUsersLegacyAnonymousPeersUnaffected(t *testing.T) {
-	conf := &DeviceConfig{
-		SecretKey: pubHex(1),
-		Peers: []*PeerConfig{
-			peer(pubHex(2), "0.0.0.0/0", "::/0"),
-		},
-	}
-	s, err := newTestServer(t, conf)
+	conf := &DeviceConfig{SecretKey: pubHex(1)}
+	s, err := newTestServer(t, conf, peer(pubHex(2), "0.0.0.0/0", "::/0"))
 	if err != nil {
 		t.Fatalf("legacy config rejected: %v", err)
 	}
@@ -127,12 +138,9 @@ func TestLoadUsersLegacyAnonymousPeersUnaffected(t *testing.T) {
 
 // 一旦有带 email 的用户,匿名的 0.0.0.0/0 peer 就会把它的流量抢走,必须拒绝混用。
 func TestLoadUsersRejectsMixedAnonymousCatchAll(t *testing.T) {
-	conf := &DeviceConfig{
-		SecretKey: pubHex(1),
-		Peers:     []*PeerConfig{peer(pubHex(4), "0.0.0.0/0", "::/0")},
-	}
+	conf := &DeviceConfig{SecretKey: pubHex(1)}
 	conf.Users = mustUsers(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
-	if _, err := newTestServer(t, conf); err == nil {
+	if _, err := newTestServer(t, conf, peer(pubHex(4), "0.0.0.0/0", "::/0")); err == nil {
 		t.Fatal("expected anonymous catch-all peer to be rejected alongside an emailed user")
 	}
 }
@@ -149,8 +157,8 @@ func TestLoadUsersRejectsDuplicatePublicKey(t *testing.T) {
 	}
 }
 
-// 初始 IPC 必须把每个用户都下发成 peer,否则用户握手直接失败。
-func TestBuildIPCRequestCoversAllUsers(t *testing.T) {
+// 每个用户都必须进用户表(上游 Start 按它生成初始 IPC),否则用户握手直接失败。
+func TestLoadUsersCoversAllUsers(t *testing.T) {
 	conf := &DeviceConfig{SecretKey: pubHex(1)}
 	conf.Users = mustUsers(t,
 		named("alice", peer(pubHex(2), "10.0.0.2/32")),
@@ -160,30 +168,21 @@ func TestBuildIPCRequestCoversAllUsers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadUsers: %v", err)
 	}
-	ipc := s.buildIPCRequest()
-	for _, want := range []string{
-		"private_key=" + pubHex(1),
-		"listen_port=1337",
-		"public_key=" + pubHex(2),
-		"public_key=" + pubHex(3),
-		"allowed_ip=10.0.0.2/32",
-		"allowed_ip=10.0.0.3/32",
-	} {
-		if !strings.Contains(ipc, want) {
-			t.Fatalf("ipc request missing %q:\n%s", want, ipc)
+	for _, email := range []string{"alice", "bob"} {
+		if s.GetUser(context.Background(), email) == nil {
+			t.Fatalf("user %s missing from the user table", email)
 		}
 	}
 }
 
-// ValidateDevicePeers 是 infra/conf Build 提前拦坏配置用的,它与 NewServer 的判定必须
+// ValidateDeviceUsers 是 infra/conf Build 提前拦坏配置用的,它与 NewServer 的判定必须
 // 完全一致:更严会让原本能跑的配置升级后起不来,更松则拦不住会让 NewServer 炸掉的配置。
-func TestValidateDevicePeersAgreesWithLoadUsers(t *testing.T) {
+func TestValidateDeviceUsersAgreesWithLoadUsers(t *testing.T) {
 	upper := strings.ToUpper("ab" + strings.Repeat("0", 62))
 	lower := "ab" + strings.Repeat("0", 62)
-	serverPub, err := serverPubKey(pubHex(1))
-	if err != nil {
-		t.Fatalf("serverPubKey: %v", err)
-	}
+	var serverPub, serverPriv [32]byte
+	copy(serverPriv[:], common.Must2(hex.DecodeString(pubHex(1))))
+	curve25519.ScalarBaseMult(&serverPub, &serverPriv)
 	cases := []struct {
 		name    string
 		users   []*protocol.User
@@ -264,6 +263,27 @@ func TestValidateDevicePeersAgreesWithLoadUsers(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// 上游把建设备挪到 Start 之后,这两类在 NewServer 里不再被 IPC 拦下,改由 validatePeerParams 提前拒。
+			name:    "psk-not-32-bytes",
+			users:   []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, PreSharedKey: strings.Repeat("ab", 15)})},
+			wantErr: true,
+		},
+		{
+			name:    "keepalive-over-uint16",
+			users:   []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, KeepAlive: "70000"})},
+			wantErr: true,
+		},
+		{
+			name:  "psk-and-keepalive-ok",
+			users: []*protocol.User{named("alice", &PeerConfig{PublicKey: pubHex(2), AllowedIps: []string{"10.0.0.2/32"}, PreSharedKey: strings.Repeat("ab", 32), KeepAlive: "25"})},
+		},
+		{
+			// 被丢弃的重复匿名 peer 进不了设备,参数不查(与合并上游前一致)。
+			name:  "dropped-anonymous-duplicate-params-unchecked",
+			users: []*protocol.User{named("alice", peer(pubHex(2), "10.0.0.2/32"))},
+			peers: []*PeerConfig{{PublicKey: pubHex(2), AllowedIps: []string{"0.0.0.0/0"}, PreSharedKey: "abcd", KeepAlive: "70000"}},
+		},
+		{
 			name:    "unparsable-allowed-ip",
 			users:   []*protocol.User{named("alice", peer(pubHex(2), "10.0.0.300/32"))},
 			wantErr: true,
@@ -271,39 +291,18 @@ func TestValidateDevicePeersAgreesWithLoadUsers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conf := &DeviceConfig{SecretKey: pubHex(1), Users: tc.users, Peers: tc.peers}
-			validateErr := ValidateDevicePeers(conf.Users, conf.Peers)
-			_, loadErr := newTestServer(t, conf)
+			conf := &DeviceConfig{SecretKey: pubHex(1), Users: tc.users}
+			validateErr := ValidateDeviceUsers(append(append([]*protocol.User(nil), tc.users...), anonymous(tc.peers)...))
+			_, loadErr := newTestServer(t, conf, tc.peers...)
 			if (validateErr != nil) != (loadErr != nil) {
-				t.Fatalf("ValidateDevicePeers err=%v but loadUsers err=%v: the two must agree", validateErr, loadErr)
+				t.Fatalf("ValidateDeviceUsers err=%v but loadUsers err=%v: the two must agree", validateErr, loadErr)
 			}
 			if (validateErr != nil) != tc.wantErr {
-				t.Fatalf("ValidateDevicePeers err=%v, wantErr=%v", validateErr, tc.wantErr)
+				t.Fatalf("ValidateDeviceUsers err=%v, wantErr=%v", validateErr, tc.wantErr)
 			}
 		})
 	}
 }
-
-// fakeTun 只记录 IpcSet,供 AddUser/RemoveUser 测试用(newTestServer 不带 tun,
-// AddUser 在 tun==nil 时直接返回 device not ready)。
-type fakeTun struct {
-	ipc []string
-}
-
-func (f *fakeTun) BuildDevice(string, conn.Bind) error { return nil }
-func (f *fakeTun) IpcSet(uapi string) error {
-	f.ipc = append(f.ipc, uapi)
-	return nil
-}
-
-func (f *fakeTun) DialContextTCPAddrPort(context.Context, netip.AddrPort) (net.Conn, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (f *fakeTun) DialUDPAddrPort(netip.AddrPort, netip.AddrPort) (net.Conn, error) {
-	return nil, errors.New("not implemented")
-}
-func (f *fakeTun) Close() error { return nil }
 
 func memUser(t *testing.T, email string, p *PeerConfig) *protocol.MemoryUser {
 	t.Helper()
@@ -314,29 +313,38 @@ func memUser(t *testing.T, email string, p *PeerConfig) *protocol.MemoryUser {
 	return mu
 }
 
-func newServerWithTun(t *testing.T, users ...*protocol.User) (*Server, *fakeTun) {
+func newServerWithUsers(t *testing.T, users ...*protocol.User) *Server {
 	t.Helper()
 	s, err := newTestServer(t, &DeviceConfig{SecretKey: pubHex(1), Users: users})
 	if err != nil {
 		t.Fatalf("loadUsers: %v", err)
 	}
-	tun := &fakeTun{}
-	s.tun = tun
-	return s, tun
+	return s
+}
+
+// addUser 按上游 AddUser 的顺序:先过 checkNewUser,通过了才下发并落表(设备下发这里省略)。
+func addUser(s *Server, u *protocol.MemoryUser) error {
+	if err := s.checkNewUser(u); err != nil {
+		return err
+	}
+	s.users.Store(u.Account.(*MemoryAccount).Pub, u)
+	return nil
+}
+
+func removeUser(s *Server, email string) {
+	if u := s.GetUser(context.Background(), email); u != nil {
+		s.users.Delete(u.Account.(*MemoryAccount).Pub)
+	}
 }
 
 // 同一 email 再加一个 peer(换密钥时先加后删):RemoveUser(email) 之后只删得掉一个,
-// 另一个继续以同一身份在线计费。必须拒绝,且不能已经把 peer 下发给设备。
+// 另一个继续以同一身份在线计费。必须拒绝,且不能已经落表。
 func TestAddUserRejectsDuplicateEmail(t *testing.T) {
 	ctx := context.Background()
-	s, tun := newServerWithTun(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
+	s := newServerWithUsers(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
 
-	err := s.AddUser(ctx, memUser(t, "alice", peer(pubHex(3), "10.0.0.3/32")))
-	if err == nil {
+	if err := addUser(s, memUser(t, "alice", peer(pubHex(3), "10.0.0.3/32"))); err == nil {
 		t.Fatal("AddUser with an existing email must fail")
-	}
-	if len(tun.ipc) != 0 {
-		t.Fatalf("rejected AddUser must not touch the device, got IpcSet %q", tun.ipc)
 	}
 	if got := s.GetUsersCount(ctx); got != 1 {
 		t.Fatalf("GetUsersCount = %d, want 1", got)
@@ -346,13 +354,13 @@ func TestAddUserRejectsDuplicateEmail(t *testing.T) {
 	}
 
 	// 其它 email 不受影响;匿名(空 email)peer 不参与 email 查重。
-	if err := s.AddUser(ctx, memUser(t, "bob", peer(pubHex(4), "10.0.0.4/32"))); err != nil {
+	if err := addUser(s, memUser(t, "bob", peer(pubHex(4), "10.0.0.4/32"))); err != nil {
 		t.Fatalf("AddUser(bob): %v", err)
 	}
-	if err := s.AddUser(ctx, memUser(t, "", peer(pubHex(5), "10.0.0.5/32"))); err != nil {
+	if err := addUser(s, memUser(t, "", peer(pubHex(5), "10.0.0.5/32"))); err != nil {
 		t.Fatalf("AddUser(anonymous #1): %v", err)
 	}
-	if err := s.AddUser(ctx, memUser(t, "", peer(pubHex(6), "10.0.0.6/32"))); err != nil {
+	if err := addUser(s, memUser(t, "", peer(pubHex(6), "10.0.0.6/32"))); err != nil {
 		t.Fatalf("AddUser(anonymous #2): %v", err)
 	}
 	if got := s.GetUsersCount(ctx); got != 4 {
@@ -360,18 +368,24 @@ func TestAddUserRejectsDuplicateEmail(t *testing.T) {
 	}
 }
 
+// 同一公钥重复添加必须拒绝:设备会把它当成同一个 peer,内存表与设备漂移。
+func TestAddUserRejectsDuplicatePublicKey(t *testing.T) {
+	s := newServerWithUsers(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
+	if err := addUser(s, memUser(t, "bob", peer(pubHex(2), "10.0.0.3/32"))); err == nil {
+		t.Fatal("expected duplicate public key to be rejected")
+	}
+}
+
 // 换密钥的正确顺序是先 RemoveUser 再 AddUser:同 email、同地址、新公钥必须能加回去。
 func TestRemoveThenAddRotatesKeyForSameEmail(t *testing.T) {
 	ctx := context.Background()
-	s, tun := newServerWithTun(t,
+	s := newServerWithUsers(t,
 		named("alice", peer(pubHex(2), "10.0.0.2/32", "fd00::2/128")),
 		named("bob", peer(pubHex(3), "10.0.0.3/32")),
 	)
 
-	if err := s.RemoveUser(ctx, "alice"); err != nil {
-		t.Fatalf("RemoveUser: %v", err)
-	}
-	if err := s.AddUser(ctx, memUser(t, "alice", peer(pubHex(7), "10.0.0.2/32", "fd00::2/128"))); err != nil {
+	removeUser(s, "alice")
+	if err := addUser(s, memUser(t, "alice", peer(pubHex(7), "10.0.0.2/32", "fd00::2/128"))); err != nil {
 		t.Fatalf("AddUser after RemoveUser: %v", err)
 	}
 	u := s.GetUserByAddr(ctx, netip.MustParseAddr("10.0.0.2"))
@@ -381,19 +395,12 @@ func TestRemoveThenAddRotatesKeyForSameEmail(t *testing.T) {
 	if got := s.GetUsersCount(ctx); got != 2 {
 		t.Fatalf("GetUsersCount = %d, want 2", got)
 	}
-	if len(tun.ipc) != 2 || !strings.Contains(tun.ipc[0], "remove=true") || !strings.Contains(tun.ipc[1], "public_key="+pubHex(7)) {
-		t.Fatalf("unexpected IpcSet sequence: %q", tun.ipc)
-	}
 }
 
 // AddUser 走的仍是同一套地址校验:与现有用户重叠必须拒绝。
 func TestAddUserRejectsOverlap(t *testing.T) {
-	ctx := context.Background()
-	s, tun := newServerWithTun(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
-	if err := s.AddUser(ctx, memUser(t, "bob", peer(pubHex(3), "10.0.0.0/24"))); err == nil {
+	s := newServerWithUsers(t, named("alice", peer(pubHex(2), "10.0.0.2/32")))
+	if err := addUser(s, memUser(t, "bob", peer(pubHex(3), "10.0.0.0/24"))); err == nil {
 		t.Fatal("expected overlap to be rejected")
-	}
-	if len(tun.ipc) != 0 {
-		t.Fatalf("rejected AddUser must not touch the device, got IpcSet %q", tun.ipc)
 	}
 }

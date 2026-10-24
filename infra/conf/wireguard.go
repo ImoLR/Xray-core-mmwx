@@ -3,28 +3,29 @@ package conf
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"strconv"
 	"strings"
 
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
+	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/proxy/wireguard"
 	"google.golang.org/protobuf/proto"
 )
 
 type WireGuardPeerConfig struct {
-	// Email 仅服务端(入站)模式有意义:填了才会被建成一个带身份的用户,
-	// 限速、并发连接数与 per-user 流量统计都以它为键。
-	// 留空则退化成匿名 peer —— 能连通,但计不了费、限不了速。
-	Email        string   `json:"email"`
 	PublicKey    string   `json:"publicKey"`
 	PreSharedKey string   `json:"preSharedKey"`
 	Endpoint     string   `json:"endpoint"`
 	KeepAlive    uint32   `json:"keepAlive"`
 	AllowedIPs   []string `json:"allowedIPs,omitempty"`
+
+	Level uint32 `json:"level"`
+	Email string `json:"email"`
 }
 
-func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
+func (c *WireGuardPeerConfig) Build() (*wireguard.PeerConfig, error) {
 	var err error
 	config := new(wireguard.PeerConfig)
 
@@ -43,8 +44,9 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 	}
 
 	config.Endpoint = c.Endpoint
-	// default 0
-	config.KeepAlive = c.KeepAlive
+	if c.KeepAlive != 0 {
+		config.KeepAlive = strconv.FormatUint(uint64(c.KeepAlive), 10)
+	}
 	if c.AllowedIPs == nil {
 		config.AllowedIps = []string{"0.0.0.0/0", "::0/0"}
 	} else {
@@ -57,14 +59,13 @@ func (c *WireGuardPeerConfig) Build() (proto.Message, error) {
 type WireGuardConfig struct {
 	IsClient bool `json:""`
 
-	NoKernelTun    bool                   `json:"noKernelTun"`
-	SecretKey      string                 `json:"secretKey"`
-	Address        []string               `json:"address"`
-	Peers          []*WireGuardPeerConfig `json:"peers"`
-	MTU            int32                  `json:"mtu"`
-	NumWorkers     int32                  `json:"workers"`
-	Reserved       []byte                 `json:"reserved"`
-	DomainStrategy string                 `json:"domainStrategy"`
+	NoKernelTun bool                   `json:"noKernelTun"`
+	SecretKey   string                 `json:"secretKey"`
+	Address     []string               `json:"address"`
+	Peers       []*WireGuardPeerConfig `json:"peers"`
+	MTU         int32                  `json:"mtu"`
+	Reserved    []byte                 `json:"reserved"`
+	DNS         []string               `json:"remoteDNS"`
 }
 
 func (c *WireGuardConfig) Build() (proto.Message, error) {
@@ -83,42 +84,41 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 		config.Endpoint = c.Address
 	}
 
-	seenEmail := make(map[string]bool, len(c.Peers))
-	for _, p := range c.Peers {
-		msg, err := p.Build()
-		if err != nil {
+	if c.IsClient {
+		config.Peers = make([]*wireguard.PeerConfig, len(c.Peers))
+		for i, p := range c.Peers {
+			msg, err := p.Build()
+			if err != nil {
+				return nil, err
+			}
+			config.Peers[i] = msg
+		}
+	} else {
+		config.Users = make([]*protocol.User, len(c.Peers))
+		processUser := func(idx int) error {
+			p := c.Peers[idx]
+			// allowedIPs 缺省会被填成 0.0.0.0/0 + ::0/0。对匿名 peer 无所谓,但对带 email 的用户是致命的:
+			// 隧道内所有源地址都会命中它,整个节点的流量和配额都算到这一个用户头上,且此后再也加不进第二个用户。
+			if p.Email != "" && len(p.AllowedIPs) == 0 {
+				return errors.New("wireguard peer ", p.Email, ": allowedIPs is required for a peer with email")
+			}
+			m, err := p.Build()
+			if err != nil {
+				return err
+			}
+			config.Users[idx] = &protocol.User{
+				Email:   p.Email,
+				Level:   p.Level,
+				Account: serial.ToTypedMessage(m),
+			}
+			return nil
+		}
+		if err := task.ParallelForN(len(c.Peers), processUser); err != nil {
 			return nil, err
 		}
-		peer := msg.(*wireguard.PeerConfig)
-
-		// 客户端模式下 peers 是「上游服务器」而不是「用户」,不做用户化处理。
-		if c.IsClient || p.Email == "" {
-			config.Peers = append(config.Peers, peer)
-			continue
-		}
-
-		// allowedIPs 缺省会被填成 0.0.0.0/0 + ::0/0。对匿名 peer 无所谓,
-		// 但对带 email 的用户是致命的:隧道内所有源地址都会命中它,
-		// 整个节点的流量和配额都算到这一个用户头上,且此后再也加不进第二个用户。
-		if len(p.AllowedIPs) == 0 {
-			return nil, errors.New("wireguard peer ", p.Email, ": allowedIPs is required for a peer with email")
-		}
-		if seenEmail[p.Email] {
-			return nil, errors.New("wireguard: duplicated peer email ", p.Email)
-		}
-		seenEmail[p.Email] = true
-
-		config.Users = append(config.Users, &protocol.User{
-			Email:   p.Email,
-			Account: serial.ToTypedMessage(peer),
-		})
-	}
-
-	// 服务端:重复公钥、allowed_ips 非规范或彼此重叠,NewServer 必然拒绝。在这里用同一套
-	// 规则提前拦下,LoadJSONConfig(写盘前的配置测试)就能发现,而不是等到入站被删掉重建、
-	// 或下次重启时整机 xray 起不来。规则不得比 NewServer 更严,见 ValidateDevicePeers。
-	if !c.IsClient {
-		if err := wireguard.ValidateDevicePeers(config.Users, config.Peers); err != nil {
+		// 重复公钥 / email、allowed_ips 非规范或彼此重叠,NewServer 必然拒绝。在这里用同一套规则提前拦下,
+		// LoadJSONConfig(写盘前的配置测试)就能发现,而不是等到入站被删掉重建、或下次重启时整机 xray 起不来。
+		if err := wireguard.ValidateDeviceUsers(config.Users); err != nil {
 			return nil, err
 		}
 	}
@@ -128,32 +128,15 @@ func (c *WireGuardConfig) Build() (proto.Message, error) {
 	} else {
 		config.Mtu = c.MTU
 	}
-	// these a fallback code exists in wireguard-go code,
-	// we don't need to process fallback manually
-	config.NumWorkers = c.NumWorkers
 
 	if len(c.Reserved) != 0 && len(c.Reserved) != 3 {
 		return nil, errors.New(`"reserved" should be empty or 3 bytes`)
 	}
 	config.Reserved = c.Reserved
 
-	switch strings.ToLower(c.DomainStrategy) {
-	case "forceip", "":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP
-	case "forceipv4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP4
-	case "forceipv6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP6
-	case "forceipv4v6":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP46
-	case "forceipv6v4":
-		config.DomainStrategy = wireguard.DeviceConfig_FORCE_IP64
-	default:
-		return nil, errors.New("unsupported domain strategy: ", c.DomainStrategy)
-	}
-
 	config.IsClient = c.IsClient
 	config.NoKernelTun = c.NoKernelTun
+	config.DNS = c.DNS
 
 	return config, nil
 }

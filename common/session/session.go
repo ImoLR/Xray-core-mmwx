@@ -7,6 +7,7 @@ import (
 
 	c "github.com/xtls/xray-core/common/ctx"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/geodata"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/signal"
@@ -55,6 +56,39 @@ type Inbound struct {
 	// CanSpliceCopy is a property for this connection
 	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
 	CanSpliceCopy int
+	// SpliceFramer 非 nil 时,splice 直通按「段」进行,每段之前先问它。见 SpliceFramer。
+	SpliceFramer SpliceFramer
+	// SpliceGate 非 nil 时,分段直通每段(含交给 SpliceFramerData 的小段)之前调用它:参数是想搬的字节数,
+	// 返回允许搬的字节数(可以更少;<= 0 表示不搬了,直通在两段之间停下)。限速器借它在直通里按段取令牌,
+	// 不必为了限速把连接逼回用户态。等待发生在两段之间,入站中止不受影响。
+	SpliceGate func(n int64) int64
+}
+
+// SpliceFramer 让「同一条连接上先后跑很多条流」的入站也能用 splice 直通。
+//
+// 普通的直通是出站把目标连接一路搬到入站连接上、直到结束,入站没有机会在连接上划出流的边界,
+// 连接只能用完即弃。入站设了 SpliceFramer 之后,出站改成一段一段地搬:每段之前先告诉入站这一段
+// 有多少字节,由入站在连接上写出自己的分段头;目标读完后入站还能接着在这条连接上写别的。
+type SpliceFramer interface {
+	// Handoff 在出站第一次直接写入站连接之前调用。closeLink 关掉出站往 link 写数据的那一端;
+	// 入站应当先调用它,再把 link 里剩下的数据全部写上线,然后返回。此后直到 Finish,入站不得再写连接。
+	Handoff(closeLink func()) error
+	// Segment 在出站直接往入站连接写 n 个字节(n > 0)之前调用。返回 false 表示入站不要了(这条流被中止):
+	// 出站不再写,直通到此为止。
+	Segment(n int64) (ok bool, err error)
+	// Written 在 Segment 声明的那一段写完之后调用。入站要中止时靠它知道「现在不在段中间」——
+	// 段写到一半时把源连接关掉,这一段就永远补不齐了。
+	Written()
+	// Finish 在直通结束时调用。err 为 nil 表示每一段都按声明的字节数写完了(目标读完、入站叫停,或者在两段之间出的错)——
+	// 连接上的分段是完整的,入站可以接着用;否则某一段没写完,连接上的字节数已经对不上分段头。
+	Finish(err error)
+}
+
+// SpliceFramerData 是 SpliceFramer 的可选扩展:很小的一段不值得走「分段头 + 直通」
+// (几次系统调用只搬几百字节),出站把它读进用户态交给入站,由入站按自己的格式写上连接。
+// 与 Segment 一样,返回 false 表示入站不要了(这条流被中止)。
+type SpliceFramerData interface {
+	Data(p []byte) (ok bool, err error)
 }
 
 // Outbound is the metadata of an outbound connection.
@@ -69,8 +103,6 @@ type Outbound struct {
 	Tag string
 	// Name of the outbound proxy that handles the connection.
 	Name string
-	// Unused. Conn is actually internet.Connection. May be nil. It is currently nil for outbound with proxySettings
-	Conn net.Conn
 	// CanSpliceCopy is a property for this connection
 	// 1 = can, 2 = after processing protocol info should be able to, 3 = cannot
 	CanSpliceCopy int
@@ -78,7 +110,8 @@ type Outbound struct {
 
 // SniffingRequest controls the behavior of content sniffing. They are from inbound config. Read-only
 type SniffingRequest struct {
-	ExcludeForDomain               []string
+	ExcludeForDomain               geodata.DomainMatcher
+	ExcludeForIP                   geodata.IPMatcher
 	OverrideDestinationForProtocol []string
 	Enabled                        bool
 	MetadataOnly                   bool

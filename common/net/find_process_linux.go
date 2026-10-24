@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && !android
 
 package net
 
@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -13,53 +14,53 @@ import (
 	"github.com/xtls/xray-core/common/errors"
 )
 
-func FindProcess(dest Destination) (PID int, Name string, AbsolutePath string, err error) {
-	isLocal, err := IsLocal(dest.Address.IP())
+func FindProcess(network, srcIP string, srcPort uint16, destIP string, destPort uint16) (PID int, Name string, AbsolutePath string, err error) {
+	isLocal, err := IsLocal(net.ParseIP(srcIP))
 	if err != nil {
 		return 0, "", "", errors.New("failed to determine if address is local: ", err)
 	}
 	if !isLocal {
 		return 0, "", "", ErrNotLocal
 	}
-	if dest.Network != Network_TCP && dest.Network != Network_UDP {
+	if network != "tcp" && network != "udp" {
 		panic("Unsupported network type for process lookup.")
 	}
-	// the core should never has a domain as source(?
-	if dest.Address.Family() == AddressFamilyDomain {
-		panic("Domain addresses are not supported for process lookup.")
-	}
-	var procFile string
 
-	switch dest.Network {
-	case Network_TCP:
-		if dest.Address.Family() == AddressFamilyIPv4 {
-			procFile = "/proc/net/tcp"
+	var procFiles []string
+
+	switch network {
+	case "tcp":
+		if net.ParseIP(srcIP).To4() != nil {
+			procFiles = []string{"/proc/net/tcp"}
+		} else {
+			procFiles = []string{"/proc/net/tcp6"}
 		}
-		if dest.Address.Family() == AddressFamilyIPv6 {
-			procFile = "/proc/net/tcp6"
-		}
-	case Network_UDP:
-		if dest.Address.Family() == AddressFamilyIPv4 {
-			procFile = "/proc/net/udp"
-		}
-		if dest.Address.Family() == AddressFamilyIPv6 {
-			procFile = "/proc/net/udp6"
+	case "udp":
+		if net.ParseIP(srcIP).To4() != nil {
+			procFiles = []string{"/proc/net/udp", "/proc/net/udp6"}
+		} else {
+			procFiles = []string{"/proc/net/udp6", "/proc/net/udp"}
 		}
 	default:
 		panic("Unsupported network type for process lookup.")
 	}
 
-	targetHexAddr, err := formatLittleEndianString(dest.Address, dest.Port)
+	targetHexAddr, err := formatLittleEndianString(net.ParseIP(srcIP), Port(srcPort))
 	if err != nil {
 		return 0, "", "", errors.New("failed to format address: ", err)
 	}
 
-	inode, err := findInodeInFile(procFile, targetHexAddr)
+	portFallback := ""
+	if network == "udp" {
+		portFallback = fmt.Sprintf(":%04X", srcPort)
+	}
+
+	inode, err := findInodeInFiles(procFiles, targetHexAddr, portFallback)
 	if err != nil {
-		return 0, "", "", errors.New("could not search in ", procFile).Base(err)
+		return 0, "", "", errors.New("could not search in ", strings.Join(procFiles, " and ")).Base(err)
 	}
 	if inode == "" {
-		return 0, "", "", errors.New("connection for ", dest.Address, ":", dest.Port, " not found in ", procFile)
+		return 0, "", "", errors.New("connection for ", srcIP, ":", srcPort, " not found in ", strings.Join(procFiles, " or "))
 	}
 
 	pidStr, err := findPidByInode(inode)
@@ -86,16 +87,16 @@ func FindProcess(dest Destination) (PID int, Name string, AbsolutePath string, e
 	return pid, procName, absPath, nil
 }
 
-func formatLittleEndianString(addr Address, port Port) (string, error) {
-	ip := addr.IP()
+func formatLittleEndianString(addr net.IP, port Port) (string, error) {
+	ip := addr
 	var ipBytes []byte
-	if addr.Family() == AddressFamilyIPv4 {
+	if ip.To4() != nil {
 		ipBytes = ip.To4()
 	} else {
 		ipBytes = ip.To16()
 	}
 	if ipBytes == nil {
-		return "", errors.New("invalid IP format for ", addr.Family(), ": ", ip)
+		return "", errors.New("invalid IP format for ", addr, ": ", ip)
 	}
 
 	for i, j := 0, len(ipBytes)-1; i < j; i, j = i+1, j-1 {
@@ -106,31 +107,43 @@ func formatLittleEndianString(addr Address, port Port) (string, error) {
 	return fmt.Sprintf("%s:%s", ipHex, portHex), nil
 }
 
-func findInodeInFile(filePath, targetHexAddr string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
+func findInodeInFiles(filePaths []string, targetHexAddr, portFallback string) (string, error) {
+	onlyMatchedPort := ""
 
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		fields := strings.Fields(line)
-
-		if len(fields) < 10 {
-			continue
+	for i, filePath := range filePaths {
+		file, err := os.Open(filePath)
+		if err != nil {
+			if i > 0 && os.IsNotExist(err) {
+				continue
+			}
+			return "", err
 		}
+		defer file.Close()
 
-		localAddress := fields[1]
-		if localAddress == targetHexAddr {
-			inode := fields[9]
-			return inode, nil
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if len(fields) < 10 {
+				continue
+			}
+
+			localAddress := fields[1]
+			if localAddress == targetHexAddr {
+				return fields[9], nil
+			}
+			if portFallback != "" && strings.HasSuffix(localAddress, portFallback) {
+				wildcardIP := strings.TrimSuffix(localAddress, portFallback)
+				if (len(wildcardIP) == 8 || len(wildcardIP) == 32) && strings.Trim(wildcardIP, "0") == "" {
+					onlyMatchedPort = fields[9]
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return "", err
 		}
 	}
 
-	return "", scanner.Err()
+	return onlyMatchedPort, nil
 }
 
 func findPidByInode(inode string) (string, error) {

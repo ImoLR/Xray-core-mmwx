@@ -93,6 +93,8 @@ type Instance struct {
 
 // Instance state
 func (server *Instance) IsRunning() bool {
+	server.statusLock.Lock()
+	defer server.statusLock.Unlock()
 	return server.running
 }
 
@@ -188,6 +190,9 @@ func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
 }
 
 func initInstanceWithConfig(config *Config, server *Instance) (bool, error) {
+	if err := platform.ReloadEnvSettings(); err != nil {
+		return true, errors.New("failed to reload environment settings").Base(err)
+	}
 	if err := customconnection.EnsureControlServerFromEnvironment(); err != nil {
 		return true, errors.New("failed to start mmwx custom connection control").Base(err)
 	}
@@ -321,7 +326,7 @@ func (s *Instance) RequireFeatures(callback interface{}, optional bool) error {
 
 // AddFeature registers a feature into current Instance.
 func (s *Instance) AddFeature(feature features.Feature) error {
-	if s.running {
+	if s.IsRunning() {
 		if err := feature.Start(); err != nil {
 			errors.LogInfoInner(s.ctx, err, "failed to start feature")
 		}

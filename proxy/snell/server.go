@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	goerrors "errors"
 	"io"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	udp_proto "github.com/xtls/xray-core/common/protocol/udp"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/common/shadowtls"
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
@@ -39,6 +42,8 @@ type Server struct {
 	users  []*protocol.MemoryUser
 
 	obfs obfsConfig
+	// shadowTLS 非空时连接先过 ShadowTLS v3 外壳(仅 v4/v5,与 obfs 互斥,配置层已校验)。
+	shadowTLS *shadowtls.Config
 
 	// v6 专用(version==6 时生效)
 	version uint32
@@ -88,6 +93,9 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 		return nil, err
 	}
 	s.obfs = obfsConfig{mode: mode, host: acc0.ObfsHost}
+	if st := config.GetShadowTls(); st != nil {
+		s.shadowTLS = &shadowtls.Config{Password: st.Password, Handshake: st.Handshake, Strict: st.Strict}
+	}
 	return s, nil
 }
 
@@ -133,8 +141,23 @@ func (s *Server) Process(ctx context.Context, network xnet.Network, conn stat.Co
 		return s.processV6(ctx, conn, dispatcher, sessPolicy)
 	}
 
+	// ShadowTLS:先跟握手服务器转完 TLS 握手、剥掉外壳,拿到里面的 Snell 数据流;
+	// 认不出的连接已被整条转发给握手服务器(探测者看到的是真网站),这里直接结束。
+	var inner net.Conn = conn
+	if s.shadowTLS != nil {
+		c, err := shadowtls.Accept(ctx, conn, s.shadowTLS)
+		if err != nil {
+			if goerrors.Is(err, shadowtls.ErrFallback) {
+				errors.LogInfo(ctx, "snell: shadowtls authentication failed, relayed to handshake server")
+				return nil
+			}
+			return errors.New("snell: shadowtls").Base(err)
+		}
+		inner = c
+	}
+
 	// v4/v5:obfs 在 record 层之下,先套混淆包装;再逐 PSK 试解握手。
-	oconn := s.obfs.serverConn(conn)
+	oconn := s.obfs.serverConn(inner)
 	reader, user, err := s.handshake(oconn)
 	if err != nil {
 		return errors.New("snell: handshake").Base(err)
