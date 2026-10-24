@@ -3,7 +3,9 @@ package api
 import (
 	"fmt"
 
+	"github.com/xtls/xray-core/app/router"
 	routerService "github.com/xtls/xray-core/app/router/command"
+	"github.com/xtls/xray-core/common/geodata"
 	cserial "github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/infra/conf/serial"
@@ -79,6 +81,9 @@ func executeAddRules(cmd *base.Command, args []string) {
 		if err != nil {
 			base.Fatalf("failed to build conf: %s", err)
 		}
+		if err := inlineGeoRules(config); err != nil {
+			base.Fatalf("failed to read geo data: %s", err)
+		}
 		tmsg := cserial.ToTypedMessage(config)
 		if tmsg == nil {
 			base.Fatalf("failed to format config to TypedMessage.")
@@ -94,4 +99,26 @@ func executeAddRules(cmd *base.Command, args []string) {
 		}
 		showJSONResponse(resp)
 	}
+}
+
+// inlineGeoRules keeps this command's contract from before v26.10: geoip: and
+// geosite: entries are read here, from this process's asset location
+// (XRAY_LOCATION_ASSET), and sent as plain CIDRs and domains. Upstream now
+// sends references for the Core to resolve from its own asset location; a
+// Core whose geo files live elsewhere (the Helper keeps the FLVX shared Core's
+// pinned geo files in its state directory and points only this command at
+// them) would fail every geo rule.
+func inlineGeoRules(config *router.Config) error {
+	for _, rule := range config.Rule {
+		var err error
+		if rule.Domain, err = geodata.InlineDomainRules(rule.Domain); err != nil {
+			return err
+		}
+		for _, ips := range []*[]*geodata.IPRule{&rule.Ip, &rule.SourceIp, &rule.LocalIp} {
+			if *ips, err = geodata.InlineIPRules(*ips); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
