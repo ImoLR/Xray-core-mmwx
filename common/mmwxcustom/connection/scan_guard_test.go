@@ -192,11 +192,28 @@ func TestScanGuardHorizontalBlocksOnlyThatIdentity(t *testing.T) {
 		if _, err := manager.admitInbound(identityFromContext(userContext("flvxl-1", user)), "198.51.100.8"); err == nil {
 			t.Fatalf("blocked identity %q admitted a new client", user)
 		}
-		conn := TrackInbound(newAddressedConn("127.0.0.1", 30001, "198.51.100.8", 41000))
+		raw := newAddressedConn("127.0.0.1", 30001, "198.51.100.8", 41000)
+		conn := TrackInbound(raw)
 		if err := BindInbound(userContext("flvxl-1", user), conn); err == nil {
 			t.Fatalf("blocked identity %q bound a new client socket", user)
 		}
+		// A refused socket is closed, so a multiplexing client cannot keep
+		// a session that stays refused after the unblock.
+		if !raw.closed {
+			t.Fatalf("socket refused by the scan block for %q left open", user)
+		}
 	}
+	// A config block keeps today's behaviour: refused, not closed.
+	configBlocked, _ := newScanManager(t, guardFor("flvxl-9"))
+	if err := configBlocked.ReplaceConfig(Config{BlockedIdentities: []Identity{{InboundTag: "flvxl-9", User: "flvxl-9"}}}); err != nil {
+		t.Fatal(err)
+	}
+	Default = configBlocked
+	raw := newAddressedConn("127.0.0.1", 30009, "198.51.100.8", 41001)
+	if err := BindInbound(userContext("flvxl-9", "flvxl-9"), TrackInbound(raw)); err == nil || raw.closed {
+		t.Fatalf("config block changed: err=%v closed=%v", err, raw.closed)
+	}
+	Default = manager
 	if got := findSnapshot(t, manager, Identity{InboundTag: "flvxl-1", User: "flvxl-1"}); !got.Blocked || got.RejectedBlocked == 0 {
 		t.Fatalf("blocked snapshot = %#v", got)
 	}

@@ -220,6 +220,8 @@ type LimitError struct {
 	ManagementGroup string
 	Reason          LimitReason
 	Limit           int64
+	// scanBlock marks a refusal caused by the port-scan guard's block.
+	scanBlock bool
 }
 
 func (e *LimitError) Error() string {
@@ -1250,7 +1252,11 @@ func (m *Manager) bindInbound(identity Snapshot, tuple socketTuple, conn *tracke
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
 	if item.snapshot.Blocked {
-		return 0, m.rejectLocked(item, key, group, BlockedIdentity, 0)
+		err := m.rejectLocked(item, key, group, BlockedIdentity, 0)
+		if _, configBlocked := m.blockedIdentities[key]; !configBlocked && m.scan != nil && m.scanBlockedLocked(owner.InboundTag) {
+			err.(*LimitError).scanBlock = true
+		}
+		return 0, err
 	}
 	if m.globalLimit != nil && m.coreCurrentLocked() >= *m.globalLimit {
 		return 0, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
@@ -1719,6 +1725,12 @@ func (c *trackedInboundConn) bind(identity Snapshot) error {
 	if err != nil {
 		c.rejectErr = err
 		c.mu.Unlock()
+		// The refusal sticks to this socket. A multiplexing client (AnyTLS,
+		// Mux) would keep reusing it after the scan block is lifted, so close
+		// it like the block closed the node's other sockets.
+		if limitErr, ok := err.(*LimitError); ok && limitErr.scanBlock {
+			_ = c.Close()
+		}
 		return err
 	}
 	c.bound = true
