@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -34,7 +35,9 @@ type controlSnapshot struct {
 //   - snell.udp_per_packet_target: every Snell UDP datagram reaches its own target.
 //   - flvx.reality_guard_hop_uncounted: the Reality guard's loopback hop is not
 //     tracked, so a guarded connection counts like an unguarded one (guard_hop.go).
-var ControlFeatures = []string{"anytls.downlink_stats", "snell.udp_per_packet_target", GuardHopFeature}
+//   - scan_guard.v1: /v1/config accepts scan_guard + scan_unblock and
+//     GET /v1/scan reports hits (scan_guard.go).
+var ControlFeatures = []string{"anytls.downlink_stats", "snell.udp_per_packet_target", GuardHopFeature, ScanGuardFeature}
 
 var controlRuntime struct {
 	sync.Mutex
@@ -123,6 +126,22 @@ func newControlServer(manager *Manager) *http.Server {
 			return
 		}
 		writeControlJSON(w, http.StatusOK, map[string]any{"features": ControlFeatures})
+	})
+	mux.HandleFunc("/v1/scan", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeControlJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		var after uint64
+		if value := r.URL.Query().Get("after"); value != "" {
+			parsed, err := strconv.ParseUint(value, 10, 64)
+			if err != nil {
+				writeControlJSON(w, http.StatusBadRequest, map[string]any{"error": "after must be a seq"})
+				return
+			}
+			after = parsed
+		}
+		writeControlJSON(w, http.StatusOK, manager.ScanReport(after))
 	})
 	mux.HandleFunc("/v1/config", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPut {

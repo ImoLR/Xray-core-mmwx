@@ -69,6 +69,9 @@ type Config struct {
 	PortLimits                     []PortLimit              `json:"port_limits"`
 	ManagementMappings             []ManagementGroupMapping `json:"management_mappings"`
 	ManagementLimits               []ManagementGroupLimit   `json:"management_limits"`
+	// Port-scan guard (scan_guard.go); absent = off.
+	ScanGuard   *ScanGuardConfig `json:"scan_guard,omitempty"`
+	ScanUnblock []ScanUnblock    `json:"scan_unblock,omitempty"`
 }
 
 type TCPStateCounts struct {
@@ -313,6 +316,8 @@ type Manager struct {
 	nextSocketID          uint64
 	scanSockets           func() (map[socketTuple]string, error)
 	now                   func() time.Time
+	// scan is nil until a config enables the port-scan guard.
+	scan *scanGuard
 }
 
 var Default = NewManager()
@@ -370,6 +375,7 @@ func (m *Manager) Reset() {
 	m.portStates = make(map[string]*portState)
 	m.sockets = make(map[uint64]socketRecord)
 	m.nextSocketID = 0
+	m.scan = nil
 	m.mu.Unlock()
 }
 
@@ -540,6 +546,13 @@ func (m *Manager) ReplaceConfig(config Config) error {
 		}
 		portLimits[limit.InboundTag] = clonePortLimit(limit)
 	}
+	scanGuard, err := resolveScanGuard(config.ScanGuard)
+	if err != nil {
+		return err
+	}
+	if err := validateScanUnblock(config.ScanUnblock); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	var toClose []*trackedInboundConn
 	for conn, identity := range m.inboundConns {
@@ -560,6 +573,7 @@ func (m *Manager) ReplaceConfig(config Config) error {
 	if m.onlineIPGrace <= 0 {
 		m.onlineIPGrace = 30 * time.Second
 	}
+	m.applyScanConfigLocked(scanGuard, config.ScanUnblock)
 	for identity, item := range m.states {
 		m.applyLimitLocked(&item.snapshot, replacement[identity])
 		item.snapshot.ManagementGroup = mappings[identity]
@@ -665,6 +679,9 @@ func clonePortLimit(limit PortLimit) PortLimit {
 
 func (m *Manager) applyLimitLocked(snapshot *Snapshot, limit Limit) {
 	_, snapshot.Blocked = m.blockedIdentities[snapshot.Identity]
+	if !snapshot.Blocked && m.scan != nil {
+		snapshot.Blocked = m.scanBlockedLocked(snapshot.Identity.InboundTag)
+	}
 	// Legacy identity-scoped limit fields are intentionally ignored. Identity is
 	// retained for attribution while administrator controls live at group/port.
 	snapshot.MaxInboundOnlineIPs = nil
@@ -829,6 +846,10 @@ func (m *Manager) effectiveIdentityLocked(snapshot Snapshot) Snapshot {
 		return snapshot
 	}
 	if _, blocked := m.blockedIdentities[snapshot.Identity]; blocked {
+		snapshot.Attributed = true
+		return snapshot
+	}
+	if m.scan != nil && m.scanBlockedLocked(snapshot.Identity.InboundTag) {
 		snapshot.Attributed = true
 		return snapshot
 	}
@@ -1078,6 +1099,7 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	}
 	now := m.now()
 	identity := identityFromContext(ctx)
+	tag := identity.Identity.InboundTag
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	identity = m.effectiveIdentityLocked(identity)
@@ -1087,6 +1109,10 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	m.applyLimitLocked(&item.snapshot, limit)
 	group := m.managementMappings[key]
 	item.snapshot.ManagementGroup = group
+	scan := m.scan
+	if scan != nil && m.scanBlockedLocked(tag) {
+		return nil, m.rejectLocked(item, key, group, BlockedIdentity, 0)
+	}
 	if m.globalLimit != nil && m.coreCurrentLocked() >= *m.globalLimit {
 		return nil, m.rejectLocked(item, key, group, GlobalTotalLimit, *m.globalLimit)
 	}
@@ -1115,6 +1141,11 @@ func (m *Manager) acquire(ctx context.Context, destination xnet.Destination) (*l
 	}
 	if identity.Attributed && portLimit.MaxOutboundTCPNewPerSecond != nil && len(portState.attemptTimes) >= *portLimit.MaxOutboundTCPNewPerSecond {
 		return nil, m.rejectLocked(item, key, group, PortNewRateLimit, int64(*portLimit.MaxOutboundTCPNewPerSecond))
+	}
+	// Only dials that pass every limit reach a destination, so only they count
+	// as scanning; the dial that reaches a threshold is refused with the block.
+	if scan != nil && scan.enabled && m.scanDialLocked(tag, destination, now) {
+		return nil, m.rejectLocked(item, key, group, BlockedIdentity, 0)
 	}
 	item.attemptTimes = append(item.attemptTimes, now)
 	if group != "" {
